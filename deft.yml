@@ -1,0 +1,51 @@
+# deft.yml — service manifest. Read by ops/deft in the deft-ops repo.
+schema: 1
+name: sentinel
+brand: Sentinel
+summary: >
+  External monitor for the estate. One cron script on the OpenClaw gateway
+  probes every production host over HTTP, ICMP and SSH and posts to Slack on
+  state changes only. Runs on a box that is NOT part of what it watches, so a
+  dead datastore or a rebooted host cannot silence its own alarm. PUBLIC repo:
+  the engine is generic and open source; the real checks.yaml describes our
+  infrastructure and stays private.
+tier: 2
+status: active
+
+repo:
+  dir: ~/code/deft-platform/sentinel
+  origin: https://github.com/ethandrower/sentinel.git
+  prod_ref: origin/main
+  visibility: public
+
+stack: [python]
+
+deploy:
+  mode: scp-cron
+  host: ethand320@100.112.73.91   # oc-prod, reachable over Tailscale
+  command: SENTINEL_HOST=ethand320@100.112.73.91 ./install.sh
+  notes: >
+    install.sh copies sentinel.py + checks.yaml to ~/sentinel on the gateway,
+    runs the tests, does a live dry-run and registers a */5 cron entry. The
+    real checks.yaml is NOT in this repo — it is gitignored here and kept in
+    the private deft-agents repo at tooling/sentinel/checks.yaml.
+
+sdlc:
+  gate: none
+  ci: none
+  test: python3 test_sentinel.py    # 30 assertions, no network needed
+  review: optional
+
+secrets:
+  where: >
+    ~/.sentinel.env on the gateway (chmod 600), sourced by cron.
+    SENTINEL_SLACK_WEBHOOK and SENTINEL_HEARTBEAT_URL. Never committed —
+    this repo is public.
+
+depends_on: []
+
+known_issues:
+  - "SENTINEL_HEARTBEAT_URL is unset — nothing notices if the gateway itself dies, which is the one failure sentinel cannot self-report."
+  - "Redis/Postgres checks are unconfigured: neither runs on the prod web host, and finding them means reading credential-bearing REDIS_URL / DATABASE_URL."
+  - "The live copy on oc-prod is installed by scp, not pulled from git — nothing guarantees it matches origin/main."
+  - "Prod web host sits at 86-90% RAM steady state; the alert threshold is 95, so the baseline is a capacity question nothing currently tracks."
