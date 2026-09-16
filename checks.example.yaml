@@ -1,0 +1,131 @@
+# Copy to checks.yaml and edit. checks.yaml is gitignored on purpose — it
+# describes your infrastructure and belongs in a private repo or on the box.
+#
+# Severity: `critical` = wake someone. `warn` = look at it tomorrow.
+# Every check alerts only on STATE CHANGE, after `failures_before_alert`
+# consecutive failures. A check that has been failing for a day is silent.
+
+settings:
+  parallelism: 8
+  failures_before_alert: 2        # two consecutive misses before Slack
+  # Prefer the env vars SENTINEL_SLACK_WEBHOOK / SENTINEL_HEARTBEAT_URL
+  # (from ~/.sentinel.env) over putting secrets here.
+  slack_webhook: null
+  heartbeat_url: null             # dead-man's switch — watches the watcher
+
+checks:
+
+  # --- Public surfaces ---------------------------------------------------
+
+  # Probe a real page, not just `/`. A `/` that 302s to a login page will
+  # pass even when the app behind the redirect is broken.
+  - name: web-prod
+    type: http
+    url: https://example.com/login
+    expect_status: [200]
+    max_latency_ms: 5000
+    tls_min_days: 14              # cert expiry, folded into the same check
+    severity: critical
+
+  # A health endpoint that checks DB + cache from inside the app is the
+  # strongest single check you can have — it proves the whole chain.
+  - name: web-healthz
+    type: http
+    url: https://example.com/healthz
+    expect_status: [200]
+    body_contains: '"redis":"ok"'
+    severity: critical
+
+  # --- Hosts -------------------------------------------------------------
+
+  - name: host-web
+    type: ping
+    host: 203.0.113.10
+    severity: critical
+
+  - name: disk-web
+    type: disk
+    host: 203.0.113.10
+    path: /
+    max_percent: 85
+    severity: critical
+
+  # Set this above your real steady state or it will flap. If the baseline is
+  # genuinely high, that's a capacity problem, not an alerting threshold one.
+  - name: mem-web
+    type: memory
+    host: 203.0.113.10
+    max_percent: 95
+    severity: warn
+
+  # --- Processes ---------------------------------------------------------
+
+  # Fails if a container is missing, stopped, or reports "unhealthy".
+  - name: web-processes
+    type: docker
+    host: 203.0.113.10
+    containers:
+      - myapp.web
+      - myapp.worker
+    severity: critical
+
+  - name: web-errors
+    type: log
+    host: 203.0.113.10
+    container: myapp.web
+    pattern: 'Traceback|CRITICAL|OOMKilled'
+    since_minutes: 30
+    max_matches: 5
+    severity: warn
+
+  # --- Datastores: over SSH, not TCP -------------------------------------
+  #
+  # A passing TCP probe from outside would mean the port is reachable from
+  # there, which is usually not what you want. Ask from inside the host.
+
+  - name: redis
+    type: ssh
+    host: 203.0.113.20
+    command: docker exec my-redis redis-cli ping
+    output_matches: PONG
+    severity: critical
+
+  - name: postgres
+    type: ssh
+    host: 203.0.113.20
+    command: docker exec my-postgres pg_isready -q && echo ready
+    output_matches: ready
+    severity: critical
+
+  # Redis evicting keys silently destroys queued jobs once maxmemory is hit.
+  - name: redis-evictions
+    type: ssh
+    host: 203.0.113.20
+    command: docker exec my-redis redis-cli info stats | grep -oP 'evicted_keys:\K\d+'
+    max_value: 0
+    unit: ' evicted keys'
+    severity: warn
+
+  # Connection headroom, as a percentage of max_connections.
+  - name: postgres-connections
+    type: ssh
+    host: 203.0.113.20
+    command: >-
+      docker exec my-postgres psql -U postgres -tAc
+      "SELECT count(*)*100/setting::int FROM pg_stat_activity, pg_settings
+       WHERE name='max_connections'"
+    max_value: 80
+    unit: '% of max_connections'
+    severity: warn
+
+  # --- Dead-man's switches -----------------------------------------------
+  #
+  # For jobs whose failure mode is silence. Have the job touch a file on
+  # success, then alert when that file goes stale.
+
+  - name: nightly-backup-ran
+    type: deadman
+    host: 203.0.113.10
+    path: /var/lib/myapp/last-backup
+    max_age_minutes: 1500         # 25h, for a daily job
+    severity: critical

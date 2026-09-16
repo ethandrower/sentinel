@@ -1,0 +1,6 @@
+checks.yaml
+*.log
+state.json
+.sentinel.env
+__pycache__/
+*.pyc
