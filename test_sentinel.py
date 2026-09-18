@@ -9,6 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import sentinel  # noqa: E402
 from sentinel import Result, _shq, format_alert, load_state, reconcile, save_state  # noqa: E402
 
 FAILURES = []
@@ -141,6 +142,138 @@ def test_corrupt_state_does_not_crash():
         path = Path(f.name)
     check("corrupt state reads as empty", load_state(path) == {})
     path.unlink()
+
+
+# --------------------------------------------------------------------------
+# Log noise and masked outages
+#
+# The first production deployment wrote the same two failures every five
+# minutes for days, and one of them was a false positive — an abandoned dokku
+# deploy container. Because alerts fire on transitions, that always-failing
+# check never transitioned again, so when a real worker was OOM-killed inside
+# it, nothing was announced. These tests hold the fixes.
+# --------------------------------------------------------------------------
+
+
+def test_multiline_detail_becomes_one_line():
+    print("detail: ssh's two-line errors do not leak a bare line into the log")
+    r = Result("disk", False, "exit 255: Connection timed out during banner exchange\n"
+                              "Connection to 1.2.3.4 port 22 timed out")
+    check("no newline survives", "\n" not in r.detail)
+    check("both halves kept", "banner exchange" in r.detail and "port 22 timed out" in r.detail)
+
+
+def test_numbers_do_not_change_a_failures_identity():
+    print("identity: a wobbling count is the same failure, not a new one")
+    a = Result("errs", False, "6 matches of /Traceback/ in 30m is above threshold 5")
+    b = Result("errs", False, "7 matches of /Traceback/ in 30m is above threshold 5")
+    check("same key despite different counts", a.key == b.key)
+    state = {}
+    reconcile([a], state, 2)
+    reconcile([a], state, 2)                          # now alerting
+    newly, _ = reconcile([b], state, 2)
+    check("count wobble does not re-alert", newly == [])
+
+
+def test_a_failing_check_that_fails_differently_realerts():
+    print("changed: a new failure inside an already-failing check is announced")
+    state = {}
+    first = Result("procs", False, "worker_ai=exited", key="docker:worker_ai=exited")
+    reconcile([first], state, 2)
+    reconcile([first], state, 2)                      # alerting on worker_ai
+    worse = Result("procs", False, "worker_ai=exited; worker1=exited",
+                   key="docker:worker1=exited,worker_ai=exited")
+    newly, _ = reconcile([worse], state, 2)
+    check("the new failure alerts", [r.name for r in newly] == ["procs"])
+    check("and is labelled as a change", bool(newly) and newly[0].reason == "changed")
+    newly, _ = reconcile([worse], state, 2)
+    check("then goes quiet again", newly == [])
+
+
+def test_state_from_an_older_version_is_reannounced_once():
+    print("upgrade: a failure recorded without a key is re-announced exactly once")
+    state = {"procs": {"status": "fail", "consecutive_fail": 40, "alerting": True,
+                       "since": "2026-09-17T17:00:00+00:00", "last_detail": "x",
+                       "threshold": 2}}
+    r = Result("procs", False, "worker1=exited", key="docker:worker1=exited")
+    newly, _ = reconcile([r], state, 2)
+    check("re-announced after upgrade", [x.name for x in newly] == ["procs"])
+    check("labelled ongoing", bool(newly) and newly[0].reason == "ongoing")
+    newly, _ = reconcile([r], state, 2)
+    check("but only once", newly == [])
+
+
+def _docker(lines):
+    """check_docker against canned `docker ps -a` output — no SSH."""
+    real = sentinel._ssh
+    sentinel._ssh = lambda cfg, cmd, timeout=None: (0, "\n".join(lines), "")
+    try:
+        return sentinel.check_docker(
+            {"host": "h", "containers": ["app.web", "app.worker1", "app.worker_ai"]}
+        )
+    finally:
+        sentinel._ssh = real
+
+
+def test_docker_ignores_abandoned_dokku_deploy_containers():
+    print("docker: a failed deploy's .upcoming- container is not an outage")
+    out = _docker([
+        "app.web.1\trunning\tUp 22 hours",
+        "app.worker1.1\trunning\tUp 22 hours",
+        "app.worker_ai.1\trunning\tUp 22 hours",
+        "app.worker_ai.1.upcoming-3712\texited\tExited (127) 22 hours ago",
+    ])
+    check("all real processes running -> ok", out[0] is True)
+
+
+def test_docker_still_catches_a_real_dead_worker():
+    print("docker: ignoring deploy leftovers must not hide a real exit")
+    out = _docker([
+        "app.web.1\trunning\tUp 22 hours",
+        "app.worker1.1\texited\tExited (1) 13 hours ago",
+        "app.worker_ai.1\trunning\tUp 22 hours",
+        "app.worker_ai.1.upcoming-3712\texited\tExited (127) 22 hours ago",
+    ])
+    check("dead worker fails the check", out[0] is False)
+    check("names the dead worker", "app.worker1.1" in out[1])
+    check("does not blame the deploy leftover", "upcoming" not in out[1])
+
+
+def test_docker_key_does_not_drift_with_elapsed_time():
+    print("docker: 'About an hour ago' becoming '13 hours ago' is not a new failure")
+    a = _docker(["app.web.1\trunning\tUp", "app.worker1.1\texited\tExited (1) About an hour ago",
+                 "app.worker_ai.1\trunning\tUp"])
+    b = _docker(["app.web.1\trunning\tUp", "app.worker1.1\texited\tExited (1) 13 hours ago",
+                 "app.worker_ai.1\trunning\tUp"])
+    check("same key as time passes", a[3] == b[3])
+
+
+def test_format_alert_says_why_a_failure_is_announced():
+    print("formatting: changed and re-announced failures are labelled")
+    r = Result("procs", False, "worker1=exited")
+    r.reason = "changed"
+    check("changed is labelled", "changed" in format_alert([r], [], "h"))
+    r.reason = "ongoing"
+    check("ongoing is labelled", "re-announced" in format_alert([r], [], "h"))
+
+
+def test_status_reports_what_is_failing_now():
+    print("status: --status reads the state file, since the log no longer repeats")
+    import contextlib
+    import io
+
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "state.json"
+        state = {}
+        reconcile([bad("web"), ok("db")], state, 2)
+        reconcile([bad("web"), ok("db")], state, 2)
+        save_state(p, state)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = sentinel.print_status(p)
+        check("exit 1 while something fails", code == 1)
+        check("names the failing check", "web" in buf.getvalue())
+        check("does not list the healthy one", "  db " not in buf.getvalue())
 
 
 if __name__ == "__main__":

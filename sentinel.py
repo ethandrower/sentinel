@@ -41,17 +41,51 @@ SSH_OPTS = [
 ]
 
 
+def _stamp():
+    """UTC timestamp for log lines. A log that cannot say *when* cannot explain anything."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _one_line(text):
+    """Collapse a detail to a single line.
+
+    ssh reports some failures on two lines — "Connection timed out during banner
+    exchange", then "Connection to <host> port 22 timed out". Printed as-is the
+    second line lands in the log bare, with no check name and no status, and
+    reads as noise from nowhere.
+    """
+    return " · ".join(p.strip() for p in str(text or "").splitlines() if p.strip())
+
+
+def failure_key(detail):
+    """What a failure *is*, with the parts that drift from run to run removed.
+
+    "6 matches ... above threshold 5" and "7 matches ... above threshold 5" are
+    the same problem, and so are "91% RAM" and "93% RAM". Re-alerting on every
+    wobble in a count would be noise of its own. Checks that can say precisely
+    what is broken (the docker check names the containers) supply their own key.
+    """
+    return re.sub(r"\d+(?:\.\d+)?", "#", detail or "")
+
+
 class Result:
-    """Outcome of one check. `ok` drives alerting; `detail` is the human line."""
+    """Outcome of one check. `ok` drives alerting; `detail` is the human line.
 
-    __slots__ = ("name", "ok", "detail", "severity", "latency_ms")
+    `key` is the failure's stable identity, used to notice when an
+    already-failing check starts failing *differently*. `reason` is set by
+    `reconcile` to say why a failure is being announced.
+    """
 
-    def __init__(self, name, ok, detail, severity="critical", latency_ms=None):
+    __slots__ = ("name", "ok", "detail", "severity", "latency_ms", "key", "reason")
+
+    def __init__(self, name, ok, detail, severity="critical", latency_ms=None, key=None):
         self.name = name
         self.ok = ok
-        self.detail = detail
+        self.detail = _one_line(detail)
         self.severity = severity
         self.latency_ms = latency_ms
+        self.key = key if key is not None else failure_key(self.detail)
+        self.reason = "new"
 
 
 # --------------------------------------------------------------------------
@@ -232,20 +266,33 @@ def check_docker(cfg):
     if not out:
         return False, f"no container matching {names}", None
 
-    bad, seen = [], set()
+    bad, bad_names, seen = [], [], set()
     for line in out.splitlines():
         parts = line.split("\t")
         if len(parts) < 3:
             continue
         name, state, status = parts[0], parts[1], parts[2]
+        if ".upcoming-" in name:
+            # dokku names the container for an in-flight deploy
+            # `<app>.<proc>.<n>.upcoming-<id>`, and a deploy that fails leaves
+            # it behind, exited, indefinitely. It is not a process the app
+            # runs. Counting it made this check fail continuously — and because
+            # alerts fire on transitions, a check that is always failing never
+            # transitions, so it silently absorbed a real OOM-killed worker.
+            continue
         seen.add(name)
         if state != "running" or "unhealthy" in status.lower():
             bad.append(f"{name}={state}/{status}")
+            # The key omits the status text on purpose: "Exited (1) 13 hours
+            # ago" becomes "About an hour ago" and then "2 days ago", and a key
+            # that drifts would re-alert on the passage of time.
+            bad_names.append(f"{name}={state}")
     missing = [n for n in names if not any(s.startswith(n) for s in seen)]
     if missing:
         bad.append(f"missing={','.join(missing)}")
+        bad_names.append(f"missing={','.join(sorted(missing))}")
     if bad:
-        return False, "; ".join(bad)[:250], None
+        return False, "; ".join(bad)[:250], None, "docker:" + ",".join(sorted(bad_names))
     return True, f"{len(seen)} container(s) running", None
 
 
@@ -313,13 +360,19 @@ def run_check(cfg):
     checker = CHECKERS.get(cfg.get("type"))
     if checker is None:
         return Result(name, False, f"unknown check type {cfg.get('type')!r}", "warn")
+    key = None
     try:
-        ok, detail, latency = checker(cfg)
+        # Checkers return (ok, detail, latency) and may add a fourth element: a
+        # stable key for the failure, when they can name what broke precisely.
+        outcome = checker(cfg)
+        ok, detail, latency = outcome[0], outcome[1], outcome[2]
+        if len(outcome) > 3:
+            key = outcome[3]
     except subprocess.TimeoutExpired:
         ok, detail, latency = False, "check timed out", None
     except Exception as e:  # a broken check must not abort the whole run
         ok, detail, latency = False, f"check error: {type(e).__name__}: {e}", None
-    return Result(name, ok, detail, severity, latency)
+    return Result(name, ok, detail, severity, latency, key=key)
 
 
 def load_state(path):
@@ -364,10 +417,26 @@ def reconcile(results, state, threshold_default):
             alerting = fails >= threshold
             if alerting and not was_alerting:
                 newly_failing.append(r)
+            elif alerting and was_alerting:
+                if "key" not in prev:
+                    # State written by a version that did not record what a
+                    # failure *was*. Re-announce it once rather than assume it
+                    # is unchanged: assuming so is exactly how an OOM-killed
+                    # production worker went unreported for thirteen hours
+                    # inside a check that was already failing for another reason.
+                    r.reason = "ongoing"
+                    newly_failing.append(r)
+                elif prev["key"] != r.key:
+                    # Still failing, but failing *differently* — a second
+                    # container down, a new error. Alerting only on ok->fail
+                    # would stay silent here, which is the gap that hid the
+                    # worker above.
+                    r.reason = "changed"
+                    newly_failing.append(r)
             state[r.name] = {
                 "status": "fail", "consecutive_fail": fails, "alerting": alerting,
                 "since": prev.get("since", now) if prev.get("status") == "fail" else now,
-                "last_detail": r.detail, "threshold": threshold,
+                "last_detail": r.detail, "threshold": threshold, "key": r.key,
             }
 
     return newly_failing, recovered
@@ -386,8 +455,18 @@ def post_slack(webhook, text):
         with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.status == 200
     except Exception as e:
-        print(f"[sentinel] slack post failed: {e}", file=sys.stderr)
+        print(f"{_stamp()}  [sentinel] slack post failed: {e}", file=sys.stderr)
         return False
+
+
+_REASON_TAG = {
+    "changed": " _(changed — was already failing, now failing differently)_",
+    "ongoing": " _(already failing; re-announced once after an upgrade)_",
+}
+
+
+def _alert_line(r):
+    return f"• *{r.name}* — {r.detail}{_REASON_TAG.get(r.reason, '')}"
 
 
 def format_alert(newly_failing, recovered, hostname):
@@ -397,12 +476,12 @@ def format_alert(newly_failing, recovered, hostname):
 
     if crit:
         lines.append(f":rotating_light: *{len(crit)} CRITICAL* — production check failing")
-        lines += [f"• *{r.name}* — {r.detail}" for r in crit]
+        lines += [_alert_line(r) for r in crit]
     if warn:
         if lines:
             lines.append("")
         lines.append(f":warning: *{len(warn)} warning*")
-        lines += [f"• *{r.name}* — {r.detail}" for r in warn]
+        lines += [_alert_line(r) for r in warn]
     if recovered:
         if lines:
             lines.append("")
@@ -428,10 +507,32 @@ def heartbeat(url):
     try:
         urllib.request.urlopen(url, timeout=10).read()
     except Exception as e:
-        print(f"[sentinel] heartbeat failed: {e}", file=sys.stderr)
+        print(f"{_stamp()}  [sentinel] heartbeat failed: {e}", file=sys.stderr)
 
 
 # --------------------------------------------------------------------------
+
+def print_status(state_path):
+    """What is failing right now, read from the state file.
+
+    With --quiet the log records only changes, so "is anything still broken?"
+    is answered here rather than by scrolling back through repeats.
+    """
+    state = load_state(state_path)
+    if not state:
+        print("no state yet — sentinel has not completed a run")
+        return 0
+    failing = {n: s for n, s in state.items() if s.get("status") == "fail"}
+    if not failing:
+        print(f"all {len(state)} checks passing")
+        return 0
+    print(f"{len(failing)} of {len(state)} checks failing:\n")
+    for name, s in sorted(failing.items(), key=lambda kv: kv[1].get("since", "")):
+        flag = "ALERTED" if s.get("alerting") else "damped "
+        print(f"  {flag}  {name:<28} since {s.get('since', '?')}  ({s.get('consecutive_fail', 0)} runs)")
+        print(f"           {s.get('last_detail', '')}")
+    return 1
+
 
 def main():
     ap = argparse.ArgumentParser(description="Lean estate monitor.")
@@ -440,8 +541,18 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="print results; never alert or write state")
     ap.add_argument("--only", metavar="NAME", help="run a single check by name")
     ap.add_argument("--list", action="store_true", help="list configured checks and exit")
-    ap.add_argument("--quiet", action="store_true", help="print only failures")
+    ap.add_argument(
+        "--quiet", action="store_true",
+        help="log only changes: new failures, changed failures and recoveries",
+    )
+    ap.add_argument(
+        "--status", action="store_true",
+        help="show what is failing now, from the state file, and exit",
+    )
     args = ap.parse_args()
+
+    if args.status:
+        return print_status(args.state)
 
     cfg = yaml.safe_load(args.config.read_text()) or {}
     checks = cfg.get("checks", [])
@@ -462,20 +573,34 @@ def main():
     with ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(run_check, checks))
 
-    for r in results:
-        if r.ok and args.quiet:
-            continue
-        print(f"{'ok  ' if r.ok else 'FAIL'}  {r.name:<28} {r.detail}")
-
     failing = [r for r in results if not r.ok]
 
+    # Interactive and dry runs print every check, so a person running it by
+    # hand sees the whole picture.
+    if args.dry_run or not args.quiet:
+        for r in results:
+            print(f"{_stamp()}  {'ok  ' if r.ok else 'FAIL'}  {r.name:<28} {r.detail}")
+
     if args.dry_run:
-        print(f"\n[dry-run] {len(failing)}/{len(results)} failing; state and Slack untouched")
+        print(f"{_stamp()}  [dry-run] {len(failing)}/{len(results)} failing; state and Slack untouched")
         return 1 if failing else 0
 
     state = load_state(args.state)
     newly_failing, recovered = reconcile(results, state, settings.get("failures_before_alert", 2))
     save_state(args.state, state)
+
+    if args.quiet:
+        # The cron log records *changes* — the same things Slack is told. A
+        # check that has been failing for a day belongs in the state file (see
+        # --status), not repeated every five minutes: that repetition is what
+        # buried an OOM-killed production worker under 260 identical lines.
+        for r in newly_failing:
+            tag = {"changed": "CHANGED  ", "ongoing": "ONGOING  "}.get(r.reason, "FAIL     ")
+            print(f"{_stamp()}  {tag} {r.name:<28} {r.detail}")
+        for r, _since in recovered:
+            print(f"{_stamp()}  RECOVERED {r.name:<28} {r.detail}")
+        if newly_failing or recovered:
+            print(f"{_stamp()}  run: {len(results)} checks, {len(failing)} failing")
 
     if newly_failing or recovered:
         webhook = os.environ.get("SENTINEL_SLACK_WEBHOOK") or settings.get("slack_webhook")
@@ -483,7 +608,10 @@ def main():
         if webhook:
             post_slack(webhook, text)
         else:
-            print("[sentinel] no webhook configured; alert follows:\n" + text, file=sys.stderr)
+            print(
+                f"{_stamp()}  [sentinel] no webhook configured; alert follows:\n" + text,
+                file=sys.stderr,
+            )
 
     # Heartbeat last and only on a completed run, so a crashed sentinel trips the switch.
     heartbeat(os.environ.get("SENTINEL_HEARTBEAT_URL") or settings.get("heartbeat_url"))

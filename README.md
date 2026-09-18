@@ -58,6 +58,15 @@ This is what decides whether anyone still reads the channel in a month.
   row before Slack hears about it. One blip stays quiet.
 - **State-change only** — a host down for six hours produces *one* alert, not
   seventy-two.
+- **…but a check that starts failing *differently* speaks up** — a check that
+  covers several things (every container of an app, say) is one check but many
+  possible failures. If it is already failing for one reason and a second one
+  appears, that is announced as *changed*. Numbers are ignored when comparing,
+  so an error count wobbling between 6 and 7 is not a new failure. Without
+  this, one stuck false positive silences everything else behind it.
+- **Deploy leftovers are not outages** — dokku's `*.upcoming-<n>` containers
+  from an abandoned deploy are ignored by `docker` checks; the app's real
+  process containers are still checked.
 - **Recovery notices** — and only if a failure was actually announced, so a
   silent blip doesn't produce a cheerful "recovered!" for something nobody
   knew was broken.
@@ -71,10 +80,16 @@ This is what decides whether anyone still reads the channel in a month.
 ./sentinel.py --dry-run         # run everything, print, touch nothing
 ./sentinel.py --only web-prod   # one check
 ./sentinel.py --list            # what's configured
-./sentinel.py --quiet           # print only failures (what cron uses)
+./sentinel.py --quiet           # log only changes (what cron uses)
+./sentinel.py --status          # what is failing right now, from the state file
 ```
 
 Exit code is `1` if anything is failing, `0` if all clear.
+
+With `--quiet` the log is a record of *changes*: one timestamped line when a
+check starts failing, fails differently, or recovers, and nothing at all on a
+run where nothing changed. A steady outage therefore does not repeat every five
+minutes — use `--status` to see what is failing now and since when.
 
 ## Setup
 
