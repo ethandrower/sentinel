@@ -389,11 +389,19 @@ def save_state(path, state):
     tmp.replace(path)  # atomic — a killed run never leaves truncated state
 
 
-def reconcile(results, state, threshold_default):
+def reconcile(results, state, threshold_default, clear_default=2):
     """Fold results into state. Returns (newly_failing, recovered) for alerting.
 
     Only transitions are returned, so a host that has been down for six hours
     produces one alert, not seventy-two.
+
+    Recovery is damped the same way failure is. A check that has alerted must
+    come back clean `clear_after` times before it is called recovered, because a
+    measurement that sits on its threshold — 6 errors, then 5, then 6 — crosses
+    it every few minutes, and announcing each crossing produces a stream of
+    alternating "warning" and "recovered" posts that say nothing and train
+    everyone to ignore the channel. Until it clears, the check stays in its
+    alerting state, so the next failure is not a new alert either.
     """
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     newly_failing, recovered = [], []
@@ -403,18 +411,35 @@ def reconcile(results, state, threshold_default):
         was_alerting = prev.get("alerting", False)
         threshold = prev.get("threshold", threshold_default)
 
+        clear_after = prev.get("clear_after", clear_default)
+
         if r.ok:
+            clean = prev.get("consecutive_ok", 0) + 1
+            if was_alerting and clean < clear_after:
+                # Clean, but not yet clean enough to say so. Hold the alerting
+                # state: this is the run that would otherwise announce a
+                # recovery the next run takes back.
+                state[r.name] = {
+                    **prev, "status": "ok", "consecutive_fail": 0, "consecutive_ok": clean,
+                    "alerting": True, "last_detail": r.detail,
+                    "threshold": threshold, "clear_after": clear_after,
+                }
+                continue
             if was_alerting:
                 recovered.append((r, prev.get("since")))
             state[r.name] = {
-                "status": "ok", "consecutive_fail": 0, "alerting": False,
+                "status": "ok", "consecutive_fail": 0, "consecutive_ok": clean, "alerting": False,
                 "since": prev.get("since", now) if prev.get("status") == "ok" else now,
-                "last_detail": r.detail, "threshold": threshold,
+                "last_detail": r.detail, "threshold": threshold, "clear_after": clear_after,
             }
         else:
             fails = prev.get("consecutive_fail", 0) + 1
-            # Damping: stay quiet until the failure repeats, so one blip is not a page.
-            alerting = fails >= threshold
+            # Damping: stay quiet until the failure repeats, so one blip is not a
+            # page. It gates *entering* an episode, not continuing one — a check
+            # that is already alerting and fails again mid-recovery stays in the
+            # same episode, or a measurement crossing its threshold would drop
+            # out of alerting and re-announce itself on the way back up.
+            alerting = was_alerting or fails >= threshold
             if alerting and not was_alerting:
                 newly_failing.append(r)
             elif alerting and was_alerting:
@@ -434,9 +459,11 @@ def reconcile(results, state, threshold_default):
                     r.reason = "changed"
                     newly_failing.append(r)
             state[r.name] = {
-                "status": "fail", "consecutive_fail": fails, "alerting": alerting,
+                "status": "fail", "consecutive_fail": fails, "consecutive_ok": 0,
+                "alerting": alerting,
                 "since": prev.get("since", now) if prev.get("status") == "fail" else now,
                 "last_detail": r.detail, "threshold": threshold, "key": r.key,
+                "clear_after": clear_after,
             }
 
     return newly_failing, recovered
@@ -586,7 +613,12 @@ def main():
         return 1 if failing else 0
 
     state = load_state(args.state)
-    newly_failing, recovered = reconcile(results, state, settings.get("failures_before_alert", 2))
+    newly_failing, recovered = reconcile(
+        results,
+        state,
+        settings.get("failures_before_alert", 2),
+        settings.get("clear_after", 2),
+    )
     save_state(args.state, state)
 
     if args.quiet:

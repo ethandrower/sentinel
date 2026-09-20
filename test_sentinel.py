@@ -60,7 +60,9 @@ def test_recovery_alerts_only_if_we_had_alerted():
     reconcile([bad("web")], state, 2)
     reconcile([bad("web")], state, 2)          # now alerting
     newly, rec = reconcile([ok("web")], state, 2)
-    check("recovery is announced", [r.name for r, _ in rec] == ["web"])
+    check("one clean run is not yet a recovery", rec == [])
+    newly, rec = reconcile([ok("web")], state, 2)
+    check("recovery is announced once it holds", [r.name for r, _ in rec] == ["web"])
     check("state is clean", state["web"]["status"] == "ok")
     check("counter reset", state["web"]["consecutive_fail"] == 0)
 
@@ -255,6 +257,38 @@ def test_format_alert_says_why_a_failure_is_announced():
     check("changed is labelled", "changed" in format_alert([r], [], "h"))
     r.reason = "ongoing"
     check("ongoing is labelled", "re-announced" in format_alert([r], [], "h"))
+
+
+def test_a_measurement_sitting_on_its_threshold_alerts_once():
+    print("flapping: 6 errors, then 5, then 6 is one alert, not a stream")
+    # The real case: a log check counting 4-6 matches against a threshold of 5
+    # produced alternating "warning" and "recovered" posts every ~35 minutes.
+    state = {}
+    alerts = 0
+    recoveries = 0
+    for value in [6, 6, 5, 6, 5, 6, 6, 5, 6]:      # above, below, above ...
+        result = Result("errs", value <= 5, f"{value} matches of /Traceback/ in 30m", "warn")
+        newly, rec = reconcile([result], state, 2)
+        alerts += len(newly)
+        recoveries += len(rec)
+    check("one alert for the whole episode", alerts == 1)
+    check("and no recovery while it keeps crossing back", recoveries == 0)
+
+    # It still recovers once the thing actually stops.
+    for _ in range(3):
+        newly, rec = reconcile([Result("errs", True, "2 matches of /Traceback/ in 30m")], state, 2)
+        recoveries += len(rec)
+    check("recovery announced when it really clears", recoveries == 1)
+
+
+def test_a_real_outage_still_recovers_promptly():
+    print("recovery: damping costs one run, not an hour")
+    state = {}
+    reconcile([bad("web")], state, 2)
+    reconcile([bad("web")], state, 2)
+    reconcile([ok("web")], state, 2)
+    newly, rec = reconcile([ok("web")], state, 2)
+    check("announced on the second clean run", [r.name for r, _ in rec] == ["web"])
 
 
 def test_status_reports_what_is_failing_now():
