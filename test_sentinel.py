@@ -310,6 +310,100 @@ def test_status_reports_what_is_failing_now():
         check("does not list the healthy one", "  db " not in buf.getvalue())
 
 
+# --------------------------------------------------------------------------
+# json checks: an endpoint names what is wrong; sentinel alerts on exactly that
+# --------------------------------------------------------------------------
+
+
+def _serve(body, status=200):
+    """A throwaway local HTTP server returning `body`; records the last request's headers."""
+    import http.server
+    import threading
+
+    seen = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            seen["auth"] = self.headers.get("Authorization")
+            payload = body if isinstance(body, bytes) else json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_port}/health", seen
+
+
+def _json(body, status=200, **cfg):
+    server, url, seen = _serve(body, status)
+    try:
+        return sentinel.check_json({"url": url, **cfg}), seen
+    finally:
+        server.shutdown()
+
+
+def test_json_nothing_failing_is_healthy():
+    print("json: an empty failing list is healthy")
+    (outcome, _) = _json({"failing": [], "queues": []})
+    check("ok", outcome[0] is True)
+
+
+def test_json_names_exactly_what_is_failing():
+    print("json: the detail is the endpoint's own words")
+    (outcome, _) = _json({"failing": ["reports=stale"]})
+    check("fails", outcome[0] is False)
+    check("detail names the queue", outcome[1] == "reports=stale")
+
+
+def test_json_key_ignores_counts_but_not_new_problems():
+    print("json: +3 -> +7 evictions is the same problem; a second queue is a new one")
+    (a, _) = _json({"failing": ["broker.evictions=+3"]})
+    (b, _) = _json({"failing": ["broker.evictions=+7"]})
+    (c, _) = _json({"failing": ["broker.evictions=+7", "reports=stale"]})
+    check("count change keeps the key", a[3] == b[3])
+    check("a new problem changes the key", b[3] != c[3])
+
+
+def test_json_sends_the_bearer_from_the_environment():
+    print("json: the token comes from an env var, never the config file")
+    import os
+
+    os.environ["SENTINEL_TEST_TOKEN"] = "s3cret"
+    try:
+        (outcome, seen) = _json({"failing": []}, bearer_env="SENTINEL_TEST_TOKEN")
+    finally:
+        del os.environ["SENTINEL_TEST_TOKEN"]
+    check("authenticated", seen.get("auth") == "Bearer s3cret")
+    check("ok", outcome[0] is True)
+
+
+def test_json_missing_token_is_a_failure_not_an_anonymous_request():
+    print("json: a missing token fails loudly instead of reading 401s as an outage")
+    (outcome, seen) = _json({"failing": []}, bearer_env="SENTINEL_DOES_NOT_EXIST")
+    check("fails", outcome[0] is False)
+    check("says why", "SENTINEL_DOES_NOT_EXIST is not set" in outcome[1])
+    check("never sent the request", "auth" not in seen)
+
+
+def test_json_http_error_fails():
+    print("json: a 5xx means the app itself is down")
+    (outcome, _) = _json({"failing": []}, status=503)
+    check("fails", outcome[0] is False and outcome[1] == "HTTP 503")
+
+
+def test_json_unreadable_or_wrong_shape_fails():
+    print("json: an answer sentinel cannot read is never treated as healthy")
+    (not_json, _) = _json(b"<html>login</html>")
+    (no_field, _) = _json({"status": "ok"})
+    check("non-JSON fails", not_json[0] is False)
+    check("missing field fails", no_field[0] is False and "no 'failing' list" in no_field[1])
+
+
 if __name__ == "__main__":
     for fn in [v for k, v in sorted(globals().items()) if k.startswith("test_")]:
         fn()

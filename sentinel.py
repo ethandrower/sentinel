@@ -154,6 +154,54 @@ def check_http(cfg):
     return True, f"HTTP {status} in {latency_ms}ms", latency_ms
 
 
+def check_json(cfg):
+    """GET a JSON health endpoint and fail on exactly the problems it names.
+
+    The endpoint does the judging — "this queue has not moved in 15 minutes",
+    "the broker is evicting keys" — and returns them as a list (`field`,
+    default "failing"). An empty list is healthy. The failure key is the set of
+    names with numbers stripped, so a second queue going stale inside an
+    already-failing check re-alerts as "changed", while a count creeping from
+    +3 to +7 evictions does not.
+
+    A bearer token, when needed, is read from the environment variable named
+    by `bearer_env`: secrets never go in checks.yaml. A missing variable is a
+    failure, not an unauthenticated request — a monitor that silently stops
+    authenticating would read every 401 as the app being down.
+    """
+    url, field = cfg["url"], cfg.get("field", "failing")
+    headers = {"User-Agent": "sentinel/1.0", "Accept": "application/json"}
+    token_env = cfg.get("bearer_env")
+    if token_env:
+        token = os.environ.get(token_env, "")
+        if not token:
+            return False, f"{token_env} is not set; cannot authenticate", None, "json:no-token"
+        headers["Authorization"] = f"Bearer {token}"
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    started = time.monotonic()
+    try:
+        resp = opener.open(urllib.request.Request(url, headers=headers), timeout=cfg.get("timeout", 15))
+        status, body = resp.status, resp.read(262144)
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}", None, f"json:http-{e.code}"
+    except Exception as e:
+        return False, f"unreachable: {type(e).__name__}: {e}", None, "json:unreachable"
+    latency_ms = int((time.monotonic() - started) * 1000)
+
+    try:
+        items = json.loads(body).get(field)
+    except (ValueError, AttributeError):
+        return False, f"HTTP {status} but the response is not a JSON object", latency_ms, "json:not-json"
+    if not isinstance(items, list):
+        return False, f"HTTP {status} but no {field!r} list in the response", latency_ms, "json:shape"
+    if items:
+        names = [str(item) for item in items]
+        key = "json:" + ",".join(sorted(failure_key(name) for name in names))
+        return False, "; ".join(names)[:250], latency_ms, key
+    return True, f"HTTP {status}, nothing failing, in {latency_ms}ms", latency_ms
+
+
 def check_tcp(cfg):
     host, port = cfg["host"], int(cfg["port"])
     timeout = cfg.get("timeout", 8)
@@ -344,7 +392,7 @@ def _shq(s):
 
 
 CHECKERS = {
-    "http": check_http, "tcp": check_tcp, "ping": check_ping, "ssh": check_ssh,
+    "http": check_http, "json": check_json, "tcp": check_tcp, "ping": check_ping, "ssh": check_ssh,
     "disk": check_disk, "memory": check_memory, "docker": check_docker,
     "log": check_log, "deadman": check_deadman,
 }

@@ -27,6 +27,7 @@ report is its own death, which is what `heartbeat_url` is for.
 | type | proves | key options |
 |---|---|---|
 | `http` | responds, fast enough, valid TLS | `expect_status`, `body_contains`, `max_latency_ms`, `tls_min_days` |
+| `json` | a health endpoint reports nothing failing | `url`, `field` (default `failing`), `bearer_env` |
 | `ping` | host is up at all | `count` |
 | `tcp` | a port is open | `host`, `port` |
 | `ssh` | anything expressible as a command | `max_value`, `min_value`, `output_matches` |
@@ -38,6 +39,15 @@ report is its own death, which is what `heartbeat_url` is for.
 
 TLS expiry rides along with the HTTPS check, so there's no separate cert
 monitor to forget about.
+
+`json` is for an app that can judge its own health better than an outside
+probe can — "this queue has not moved in 15 minutes", "the broker is evicting
+keys". The endpoint returns the problems as a list; empty means healthy. Each
+name becomes part of the failure key (numbers stripped), so a second problem
+appearing inside an already-failing check alerts as *changed*, while a count
+creeping upward does not. A token, if needed, comes from the environment
+variable named by `bearer_env`, never from `checks.yaml`; a missing variable
+fails the check rather than sending an anonymous request.
 
 `disk`, `memory`, `docker`, `log` and `deadman` are sugar over `ssh` — they
 build a command, run it, and compare. Anything they can't express, `ssh` with
