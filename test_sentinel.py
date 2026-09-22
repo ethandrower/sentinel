@@ -434,6 +434,118 @@ def test_an_unreadable_last_run_does_not_silence_a_check():
     check("bad timestamp -> due", sentinel.is_due({"every_minutes": 60}, {"last_run": "yesterday"}))
 
 
+# --------------------------------------------------------------------------
+# Slack threads: one per incident, changes and the recovery inside it
+# --------------------------------------------------------------------------
+
+
+def _fake_slack(ok=True):
+    """A local stand-in for chat.postMessage; records every post."""
+    import http.server
+    import threading
+
+    posts = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            posts.append({**body, "auth": self.headers.get("Authorization")})
+            reply = {"ok": True, "ts": f"1000.{len(posts)}"} if ok else {"ok": False, "error": "not_in_channel"}
+            payload = json.dumps(reply).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    sentinel.SLACK_API = f"http://127.0.0.1:{server.server_port}/chat.postMessage"
+    return server, posts
+
+
+def _cycle(results, state):
+    """One sentinel run's alerting half, as main() does it."""
+    threads = {n: e.get("thread_ts") for n, e in state.items() if e.get("thread_ts")}
+    newly, rec = reconcile(results, state, 2)
+    events = sentinel.build_events(newly, rec, state, "monitor-host")
+    return events, sentinel.announce_threaded(events, state, threads, "xoxb-test", "C0ALERTS")
+
+
+def test_an_incident_is_one_thread():
+    print("threads: fail opens a thread; changed and recovered reply inside it")
+    server, posts = _fake_slack()
+    try:
+        state = {}
+        _cycle([Result("procs", False, "a=exited", key="docker:a")], state)      # damped
+        _cycle([Result("procs", False, "a=exited", key="docker:a")], state)      # FAIL
+        _cycle([Result("procs", False, "a=exited; b=exited", key="docker:a,b")], state)  # CHANGED
+        _cycle([ok("procs")], state)                                               # clean, held
+        _cycle([ok("procs")], state)                                               # RECOVERED
+    finally:
+        server.shutdown()
+    check("three posts: fail, changed, recovered", len(posts) == 3)
+    check("the failure opens the thread", "thread_ts" not in posts[0])
+    check("the change replies in it", posts[1].get("thread_ts") == "1000.1")
+    check("the recovery replies in it", posts[2].get("thread_ts") == "1000.1")
+    check("posted as the bot", posts[0]["auth"] == "Bearer xoxb-test" and posts[0]["channel"] == "C0ALERTS")
+    check("the thread is forgotten once recovered", "thread_ts" not in state["procs"])
+
+
+def test_the_next_incident_gets_a_new_thread():
+    print("threads: a later failure of the same check starts fresh")
+    server, posts = _fake_slack()
+    try:
+        state = {}
+        for results in ([bad("web")], [bad("web")], [ok("web")], [ok("web")], [bad("web")], [bad("web")]):
+            _cycle(results, state)
+    finally:
+        server.shutdown()
+    check("fail, recovered, fail", len(posts) == 3)
+    check("second incident is a new top-level post", "thread_ts" not in posts[2])
+    check("and has its own thread", state["web"]["thread_ts"] == "1000.3")
+
+
+def test_a_refused_bot_post_is_handed_back_for_the_fallback():
+    print("threads: if Slack refuses the bot, the alert is returned undelivered, not lost")
+    server, _ = _fake_slack(ok=False)
+    try:
+        state = {}
+        _cycle([bad("web")], state)
+        _, undelivered = _cycle([bad("web")], state)
+    finally:
+        server.shutdown()
+    check("returned for the webhook fallback", [e["check"] for e in undelivered] == ["web"])
+
+
+def test_events_share_one_incident_id_and_are_appended():
+    print("events: fail, changed and recovered belong to one incident; the log only grows")
+    server, _ = _fake_slack()
+    try:
+        state, all_events = {}, []
+        for results in (
+            [Result("q", False, "x=stale", key="json:x")],
+            [Result("q", False, "x=stale", key="json:x")],
+            [Result("q", False, "x=stale; y=stale", key="json:x,y")],
+            [ok("q")],
+            [ok("q")],
+        ):
+            events, _ = _cycle(results, state)
+            all_events += events
+    finally:
+        server.shutdown()
+    check("three transitions", [e["event"] for e in all_events] == ["fail", "changed", "recovered"])
+    check("one incident id", len({e["incident"] for e in all_events}) == 1)
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "events.jsonl"
+        sentinel.append_events(path, all_events[:2])
+        sentinel.append_events(path, all_events[2:])
+        lines = path.read_text().splitlines()
+    check("appended, never rewritten", len(lines) == 3 and json.loads(lines[2])["event"] == "recovered")
+
+
 if __name__ == "__main__":
     for fn in [v for k, v in sorted(globals().items()) if k.startswith("test_")]:
         fn()

@@ -25,6 +25,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -506,7 +507,11 @@ def reconcile(results, state, threshold_default, clear_default=2):
                     # worker above.
                     r.reason = "changed"
                     newly_failing.append(r)
+            # **prev keeps fields that belong to the episode, such as the Slack
+            # thread it is being discussed in. A recovery rebuilds the entry
+            # from scratch, so they never leak into the next incident.
             state[r.name] = {
+                **prev,
                 "status": "fail", "consecutive_fail": fails, "consecutive_ok": 0,
                 "alerting": alerting,
                 "since": prev.get("since", now) if prev.get("status") == "fail" else now,
@@ -573,6 +578,115 @@ def format_alert(newly_failing, recovered, hostname):
 
     lines.append(f"\n_sentinel on {hostname} · {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}_")
     return "\n".join(lines)
+
+
+SLACK_API = os.environ.get("SENTINEL_SLACK_API", "https://slack.com/api/chat.postMessage")
+
+
+def post_slack_bot(token, channel, text, thread_ts=None):
+    """Post as a Slack bot and return the message's `ts`, or None on failure.
+
+    Unlike an incoming webhook, chat.postMessage returns the message timestamp,
+    which is what a reply needs as its `thread_ts`. That is the whole reason for
+    the bot path: one thread per incident, with changes and the recovery inside
+    it rather than as separate posts nobody can connect.
+    """
+    body = {"channel": channel, "text": text, "unfurl_links": False, "unfurl_media": False}
+    if thread_ts:
+        body["thread_ts"] = thread_ts
+    req = urllib.request.Request(
+        SLACK_API,
+        data=json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            reply = json.loads(resp.read() or b"{}")
+    except Exception as e:
+        print(f"{_stamp()}  [sentinel] slack bot post failed: {e}", file=sys.stderr)
+        return None
+    if not reply.get("ok"):
+        # Slack answers 200 with ok:false for a bad token, a missing channel or
+        # a bot that was never invited; the error field says which.
+        print(f"{_stamp()}  [sentinel] slack bot post refused: {reply.get('error')}", file=sys.stderr)
+        return None
+    return reply.get("ts")
+
+
+# --------------------------------------------------------------------------
+# Events: the append-only record of every transition
+# --------------------------------------------------------------------------
+
+def build_events(newly_failing, recovered, state, hostname):
+    """One record per transition. `incident` is stable for a check's whole episode.
+
+    `state` is the state after reconcile: a failing check's `since` is when the
+    episode began, so its fail, changed and recovered events share one incident id.
+    """
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    events = []
+    for r in newly_failing:
+        since = state.get(r.name, {}).get("since")
+        events.append({
+            "id": uuid.uuid4().hex, "at": now, "host": hostname, "check": r.name,
+            "event": r.reason if r.reason in ("changed", "ongoing") else "fail",
+            "severity": r.severity, "detail": r.detail, "incident": f"{r.name}@{since or now}",
+        })
+    for r, since in recovered:
+        events.append({
+            "id": uuid.uuid4().hex, "at": now, "host": hostname, "check": r.name,
+            "event": "recovered", "severity": r.severity, "detail": r.detail,
+            "incident": f"{r.name}@{since or now}", "since": since,
+        })
+    return events
+
+
+def append_events(path, events):
+    """Append events as JSON lines. Never rewritten: this is the history.
+
+    It is what Tess reads to explain an incident and what an incident ticket's
+    timeline is built from, so a failure to write it is reported, not swallowed.
+    """
+    if not events:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        for event in events:
+            fh.write(json.dumps(event, sort_keys=True) + "\n")
+
+
+def _event_line(event):
+    detail = event["detail"]
+    if event["event"] == "recovered":
+        return f":white_check_mark: *{event['check']}* recovered — {detail}"
+    icon = ":rotating_light:" if event["severity"] == "critical" else ":warning:"
+    if event["event"] == "changed":
+        return f"{icon} *{event['check']}* is now failing differently — {detail}"
+    if event["event"] == "ongoing":
+        return f"{icon} *{event['check']}* is still failing _(re-announced once after an upgrade)_ — {detail}"
+    return f"{icon} *{event['check']}* is failing — {detail}"
+
+
+def announce_threaded(events, state, threads, token, channel):
+    """Post each event in its incident's thread; return events Slack did not take.
+
+    A new failure opens a thread and its `ts` is kept in the state file for as
+    long as the incident lasts. Changes and the recovery are replies in that
+    thread, so the channel shows one line per incident instead of four
+    unconnected posts. `threads` is the state as it was before this run,
+    because a recovery clears the check's entry.
+    """
+    undelivered = []
+    for event in events:
+        thread = threads.get(event["check"]) if event["event"] != "fail" else None
+        ts = post_slack_bot(token, channel, _event_line(event), thread_ts=thread)
+        if ts is None:
+            undelivered.append(event)
+            continue
+        if event["event"] != "recovered" and event["check"] in state:
+            state[event["check"]].setdefault("thread_ts", thread or ts)
+    return undelivered
 
 
 def heartbeat(url):
@@ -691,12 +805,23 @@ def main():
         print(f"{_stamp()}  [dry-run] {len(failing)}/{len(results)} failing; state and Slack untouched")
         return 1 if failing else 0
 
+    # Threads as they stood before this run: a recovery rebuilds the check's
+    # entry, and its reply still has to land in the incident's thread.
+    threads = {name: entry.get("thread_ts") for name, entry in state.items() if entry.get("thread_ts")}
     newly_failing, recovered = reconcile(
         results,
         state,
         settings.get("failures_before_alert", 2),
         settings.get("clear_after", 2),
     )
+    events = build_events(newly_failing, recovered, state, socket.gethostname())
+    events_path = Path(
+        os.environ.get("SENTINEL_EVENTS") or settings.get("events_log") or args.state.with_name("events.jsonl")
+    ).expanduser()
+    try:
+        append_events(events_path, events)
+    except OSError as e:
+        print(f"{_stamp()}  [sentinel] could not append to {events_path}: {e}", file=sys.stderr)
     ran_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     for r in results:
         state.setdefault(r.name, {})["last_run"] = ran_at
@@ -715,16 +840,22 @@ def main():
         if newly_failing or recovered:
             print(f"{_stamp()}  run: {len(results)} checks, {len(failing)} failing")
 
-    if newly_failing or recovered:
+    if events:
         webhook = os.environ.get("SENTINEL_SLACK_WEBHOOK") or settings.get("slack_webhook")
-        text = format_alert(newly_failing, recovered, socket.gethostname())
-        if webhook:
-            post_slack(webhook, text)
+        token = os.environ.get("SENTINEL_SLACK_BOT_TOKEN")
+        channel = os.environ.get("SENTINEL_SLACK_CHANNEL") or settings.get("slack_channel")
+        if token and channel:
+            undelivered = announce_threaded(events, state, threads, token, channel)
+            save_state(args.state, state)  # keep the new threads' ts
+            # Slack refused the bot: the alert still has to go out, unthreaded.
+            text = "\n".join(_event_line(e) for e in undelivered)
         else:
-            print(
-                f"{_stamp()}  [sentinel] no webhook configured; alert follows:\n" + text,
-                file=sys.stderr,
-            )
+            text = format_alert(newly_failing, recovered, socket.gethostname())
+        if text:
+            if webhook:
+                post_slack(webhook, text)
+            else:
+                print(f"{_stamp()}  [sentinel] no Slack configured; alert follows:\n" + text, file=sys.stderr)
 
     # Heartbeat last and only on a completed run, so a crashed sentinel trips the switch.
     heartbeat(os.environ.get("SENTINEL_HEARTBEAT_URL") or settings.get("heartbeat_url"))
