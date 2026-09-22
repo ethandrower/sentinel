@@ -587,6 +587,33 @@ def heartbeat(url):
 
 # --------------------------------------------------------------------------
 
+#: Cron fires every few minutes and never exactly on the second, so a check
+#: due "every 60 minutes" would otherwise slip to every 65.
+_DUE_SLACK_SECONDS = 60
+
+
+def is_due(cfg, prev, now=None):
+    """Whether a check with `every_minutes` should run on this invocation.
+
+    Most checks run every time. Some cost real money or real load — a canary
+    that performs live scrapes through a paid proxy — and belong on a slower
+    clock than the one cron gives sentinel. Their last run is kept in the state
+    file, so the cadence survives across invocations without a second cron line.
+    """
+    every = cfg.get("every_minutes")
+    if not every:
+        return True
+    last = prev.get("last_run")
+    if not last:
+        return True
+    try:
+        last_at = datetime.fromisoformat(last)
+    except ValueError:
+        return True
+    now = now or datetime.now(timezone.utc)
+    return (now - last_at).total_seconds() >= every * 60 - _DUE_SLACK_SECONDS
+
+
 def print_status(state_path):
     """What is failing right now, read from the state file.
 
@@ -644,6 +671,10 @@ def main():
             print(f"no check named {args.only!r}", file=sys.stderr)
             return 2
 
+    state = {} if args.dry_run else load_state(args.state)
+    if not (args.only or args.dry_run):
+        checks = [c for c in checks if is_due(c, state.get(c.get("name"), {}))]
+
     workers = min(settings.get("parallelism", 8), max(len(checks), 1))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(run_check, checks))
@@ -660,13 +691,15 @@ def main():
         print(f"{_stamp()}  [dry-run] {len(failing)}/{len(results)} failing; state and Slack untouched")
         return 1 if failing else 0
 
-    state = load_state(args.state)
     newly_failing, recovered = reconcile(
         results,
         state,
         settings.get("failures_before_alert", 2),
         settings.get("clear_after", 2),
     )
+    ran_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for r in results:
+        state.setdefault(r.name, {})["last_run"] = ran_at
     save_state(args.state, state)
 
     if args.quiet:

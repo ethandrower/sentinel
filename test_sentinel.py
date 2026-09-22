@@ -404,6 +404,36 @@ def test_json_unreadable_or_wrong_shape_fails():
     check("missing field fails", no_field[0] is False and "no 'failing' list" in no_field[1])
 
 
+# --------------------------------------------------------------------------
+# every_minutes: some checks belong on a slower clock than cron's
+# --------------------------------------------------------------------------
+
+
+def test_checks_without_a_cadence_always_run():
+    print("cadence: a plain check runs on every invocation")
+    check("no every_minutes -> due", sentinel.is_due({"name": "web"}, {"last_run": "2026-09-22T12:00:00+00:00"}))
+
+
+def test_an_hourly_check_waits_for_its_hour():
+    print("cadence: an hourly canary runs once an hour, not every five minutes")
+    from datetime import datetime, timedelta, timezone
+
+    last = datetime(2026, 9, 22, 12, 0, 3, tzinfo=timezone.utc)
+    prev = {"last_run": last.isoformat()}
+    cfg = {"name": "canary", "every_minutes": 60}
+    check("never run -> due", sentinel.is_due(cfg, {}))
+    check("5 minutes later -> not due", not sentinel.is_due(cfg, prev, last + timedelta(minutes=5)))
+    check("55 minutes later -> not due", not sentinel.is_due(cfg, prev, last + timedelta(minutes=55)))
+    # Cron fires a few seconds either side of the minute; without slack an
+    # hourly check would slip to every 65 minutes.
+    check("59m58s later -> due", sentinel.is_due(cfg, prev, last + timedelta(minutes=59, seconds=58)))
+
+
+def test_an_unreadable_last_run_does_not_silence_a_check():
+    print("cadence: a corrupt timestamp runs the check rather than skipping it forever")
+    check("bad timestamp -> due", sentinel.is_due({"every_minutes": 60}, {"last_run": "yesterday"}))
+
+
 if __name__ == "__main__":
     for fn in [v for k, v in sorted(globals().items()) if k.startswith("test_")]:
         fn()

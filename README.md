@@ -49,6 +49,12 @@ creeping upward does not. A token, if needed, comes from the environment
 variable named by `bearer_env`, never from `checks.yaml`; a missing variable
 fails the check rather than sending an anonymous request.
 
+Any check can take `every_minutes` to run on a slower clock than cron's —
+for a canary that performs real work (live scrapes, paid API calls) and
+should run hourly rather than every five minutes. Its last run is kept in the
+state file, so no second cron line is needed. `--only` and `--dry-run` always
+run it.
+
 `disk`, `memory`, `docker`, `log` and `deadman` are sugar over `ssh` — they
 build a command, run it, and compare. Anything they can't express, `ssh` with
 `max_value` / `output_matches` can.
