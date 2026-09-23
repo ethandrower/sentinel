@@ -732,6 +732,9 @@ def announce_threaded(events, state, threads, token, channel, channels=None):
         if ts is None:
             undelivered.append(event)
             continue
+        # Where the event landed, so the events log and the hook can say which
+        # channel and thread a reply belongs in.
+        event["channel"], event["thread_ts"] = where, thread or ts
         if event["event"] != "recovered" and event["check"] in state:
             state[event["check"]].setdefault("thread_ts", thread or ts)
     return undelivered
@@ -894,13 +897,6 @@ def main():
         newly_failing, recovered, state, socket.gethostname(),
         {c["name"]: check_target(c) for c in checks if c.get("name")},
     )
-    events_path = Path(
-        os.environ.get("SENTINEL_EVENTS") or settings.get("events_log") or args.state.with_name("events.jsonl")
-    ).expanduser()
-    try:
-        append_events(events_path, events)
-    except OSError as e:
-        print(f"{_stamp()}  [sentinel] could not append to {events_path}: {e}", file=sys.stderr)
     ran_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     for r in results:
         state.setdefault(r.name, {})["last_run"] = ran_at
@@ -936,6 +932,16 @@ def main():
                 post_slack(webhook, text)
             else:
                 print(f"{_stamp()}  [sentinel] no Slack configured; alert follows:\n" + text, file=sys.stderr)
+
+    # Recorded after Slack, so each event carries the channel and thread it was
+    # posted in: that is how whoever picks the incident up knows where to reply.
+    events_path = Path(
+        os.environ.get("SENTINEL_EVENTS") or settings.get("events_log") or args.state.with_name("events.jsonl")
+    ).expanduser()
+    try:
+        append_events(events_path, events)
+    except OSError as e:
+        print(f"{_stamp()}  [sentinel] could not append to {events_path}: {e}", file=sys.stderr)
 
     # Hand the transitions to whatever acts on them (an agent, a ticket opener).
     # After Slack: the alert is what must never wait on anything else.

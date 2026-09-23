@@ -569,6 +569,30 @@ def test_a_refused_bot_post_is_handed_back_for_the_fallback():
     check("returned for the webhook fallback", [e["check"] for e in undelivered] == ["web"])
 
 
+def test_each_event_records_the_channel_and_thread_it_was_posted_in():
+    print("events: an event says where it landed, so whoever picks it up can reply there")
+    posted = []
+
+    def fake_post(token, channel, text, thread_ts=None):
+        posted.append(thread_ts)
+        return f"2000.{len(posted)}"
+
+    real_post = sentinel.post_slack_bot
+    sentinel.post_slack_bot = fake_post
+    try:
+        state, all_events = {}, []
+        for results in ([bad("web")], [bad("web")], [ok("web")], [ok("web")]):
+            events, _ = _cycle(results, state)
+            all_events += events
+    finally:
+        sentinel.post_slack_bot = real_post
+    fail, recovered = all_events
+    check("the failure carries its channel", fail["channel"] == "C0ALERTS")
+    check("and the thread it opened", fail["thread_ts"] == "2000.1")
+    check("the recovery carries the same thread", recovered["thread_ts"] == "2000.1")
+    check("and the same channel", recovered["channel"] == "C0ALERTS")
+
+
 def test_events_share_one_incident_id_and_are_appended():
     print("events: fail, changed and recovered belong to one incident; the log only grows")
     server, _ = _fake_slack()
