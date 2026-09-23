@@ -505,15 +505,24 @@ def test_an_alert_says_what_where_and_for_how_long():
         "detail": "'prod_ai' queue (AI extraction) has had no worker for 5 min",
     })
     check("names the system, not just the check", "cloud.citemed.com" in line)
-    check("says how long", "for 6 min" in line)
-    check("carries the endpoint's own words", "AI extraction" in line)
+    # sentinel's clock (6 min) would contradict the endpoint's own (5 min).
+    check("no duration of sentinel's own", "(for " not in line and "6 min" not in line)
+    check("carries the endpoint's own words", "no worker for 5 min" in line)
 
     recovered = sentinel._event_line({
         "check": "queues-prod", "target": "cloud.citemed.com", "event": "recovered",
         "severity": "critical", "since": since, "detail": "nothing failing",
     })
-    # "recovered (for 6 min)" would read as though the recovery lasted six minutes.
-    check("recovery says how long it was down", "recovered (after 6 min)" in recovered)
+    check("recovery says how long the alert was open",
+          recovered == ":white_check_mark: *queues-prod* on `cloud.citemed.com` recovered"
+                       " — alert open 6 min — nothing failing")
+
+    brief = sentinel._event_line({
+        "check": "queues-prod", "target": "cloud.citemed.com", "event": "recovered",
+        "severity": "critical", "detail": "nothing failing",
+        "since": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    })
+    check("under a minute", "recovered — alert open less than a minute — nothing failing" in brief)
 
 
 def test_a_check_target_is_the_system_it_watches():
@@ -753,8 +762,8 @@ def test_a_reminder_event_belongs_to_its_incident():
     check("since and target", e.get("since") == state["web"]["since"] and e.get("target") == "app.example.com")
 
 
-def test_reminder_wording_says_still_failing_and_for_how_long():
-    print("reminders: the line says it is still failing and for how long")
+def test_reminder_wording_says_still_failing():
+    print("reminders: the line says it is still failing, with the check's own detail")
     from datetime import datetime, timedelta, timezone
 
     since = (datetime.now(timezone.utc) - timedelta(hours=4)).isoformat(timespec="seconds")
@@ -763,7 +772,7 @@ def test_reminder_wording_says_still_failing_and_for_how_long():
         "severity": "critical", "since": since, "detail": "worker1=exited",
     })
     check("exact wording",
-          line == ":hourglass: *procs* on `app.example.com` is still failing (for 4.0 hours): worker1=exited")
+          line == ":hourglass: *procs* on `app.example.com` is still failing: worker1=exited")
 
 
 def test_a_reminder_replies_in_the_thread_and_is_broadcast():

@@ -622,14 +622,7 @@ def format_alert(newly_failing, recovered, hostname, reminders=()):
             lines.append("")
         lines.append(f":white_check_mark: *{len(recovered)} recovered*")
         for r, since in recovered:
-            downtime = ""
-            if since:
-                try:
-                    delta = datetime.now(timezone.utc) - datetime.fromisoformat(since)
-                    downtime = f" (down {int(delta.total_seconds() // 60)}m)"
-                except ValueError:
-                    pass
-            lines.append(f"• *{r.name}* — {r.detail}{downtime}")
+            lines.append(f"• *{r.name}*{_alert_open(since)} — {r.detail}")
     if reminders:
         if lines:
             lines.append("")
@@ -738,11 +731,12 @@ def check_target(cfg):
     return cfg.get("host", "")
 
 
-def _for_how_long(since, word="for"):
-    """How long this incident has been running, in words.
+def _for_how_long(since):
+    """How long ago `since` was, in words ("11 min", "4.0 hours"), or "".
 
-    `word` is "for" while it is failing and "after" once it has recovered —
-    "recovered (for 10 min)" reads as though the recovery lasted ten minutes.
+    `since` is when sentinel first saw the failure, not when the failure
+    began, so this is how long the alert has been open — never how long the
+    system was down. Only the check's own detail can know that.
     """
     if not since:
         return ""
@@ -751,10 +745,16 @@ def _for_how_long(since, word="for"):
     except ValueError:
         return ""
     if minutes < 1:
-        return " (just now)" if word == "for" else " (after less than a minute)"
+        return "less than a minute"
     if minutes < 90:
-        return f" ({word} {minutes:.0f} min)"
-    return f" ({word} {minutes / 60:.1f} hours)"
+        return f"{minutes:.0f} min"
+    return f"{minutes / 60:.1f} hours"
+
+
+def _alert_open(since):
+    """" — alert open 11 min" for a recovery line, or "" when `since` is unknown."""
+    open_for = _for_how_long(since)
+    return f" — alert open {open_for}" if open_for else ""
 
 
 def append_events(path, events):
@@ -772,26 +772,28 @@ def append_events(path, events):
 
 
 def _event_line(event):
-    """One line a person woken by it can act on: what, where, since when.
+    """One line a person woken by it can act on: what, where, and what is wrong.
 
     A check's name is an identifier, not an explanation, so the system it
-    watches and how long this has been going on both belong in the line.
+    watches belongs in the line. How long it has been failing is left to the
+    check's detail, which can know it; sentinel's own clock only starts when
+    it first noticed, and two contradicting durations on one line help no one.
+    A recovery says how long the alert was open, named as exactly that.
     """
     detail, where = event["detail"], event.get("target", "")
     on = f" on `{where}`" if where else ""
     if event["event"] == "recovered":
-        down = _for_how_long(event.get("since"), word="after")
-        return f":white_check_mark: *{event['check']}*{on} recovered{down} — {detail}"
-    duration = _for_how_long(event.get("since"))
+        return (f":white_check_mark: *{event['check']}*{on} recovered"
+                f"{_alert_open(event.get('since'))} — {detail}")
     if event["event"] == "reminder":
-        return f":hourglass: *{event['check']}*{on} is still failing{duration}: {detail}"
+        return f":hourglass: *{event['check']}*{on} is still failing: {detail}"
     icon = ":rotating_light:" if event["severity"] == "critical" else ":warning:"
     if event["event"] == "changed":
-        return f"{icon} *{event['check']}*{on} — something else is failing too{duration}: {detail}"
+        return f"{icon} *{event['check']}*{on} — something else is failing too: {detail}"
     if event["event"] == "ongoing":
-        return (f"{icon} *{event['check']}*{on} is still failing{duration} "
+        return (f"{icon} *{event['check']}*{on} is still failing "
                 f"_(re-announced once after an upgrade)_: {detail}")
-    return f"{icon} *{event['check']}*{on} is failing{duration}: {detail}"
+    return f"{icon} *{event['check']}*{on} is failing: {detail}"
 
 
 def announce_threaded(events, state, threads, token, channel, channels=None):
