@@ -656,8 +656,12 @@ def check_target(cfg):
     return cfg.get("host", "")
 
 
-def _for_how_long(since):
-    """How long this incident has been running, in words."""
+def _for_how_long(since, word="for"):
+    """How long this incident has been running, in words.
+
+    `word` is "for" while it is failing and "after" once it has recovered —
+    "recovered (for 10 min)" reads as though the recovery lasted ten minutes.
+    """
     if not since:
         return ""
     try:
@@ -665,10 +669,10 @@ def _for_how_long(since):
     except ValueError:
         return ""
     if minutes < 1:
-        return " (just now)"
+        return " (just now)" if word == "for" else " (after less than a minute)"
     if minutes < 90:
-        return f" (for {minutes:.0f} min)"
-    return f" (for {minutes / 60:.1f} hours)"
+        return f" ({word} {minutes:.0f} min)"
+    return f" ({word} {minutes / 60:.1f} hours)"
 
 
 def append_events(path, events):
@@ -693,9 +697,10 @@ def _event_line(event):
     """
     detail, where = event["detail"], event.get("target", "")
     on = f" on `{where}`" if where else ""
-    duration = _for_how_long(event.get("since"))
     if event["event"] == "recovered":
-        return f":white_check_mark: *{event['check']}*{on} recovered{duration} — {detail}"
+        down = _for_how_long(event.get("since"), word="after")
+        return f":white_check_mark: *{event['check']}*{on} recovered{down} — {detail}"
+    duration = _for_how_long(event.get("since"))
     icon = ":rotating_light:" if event["severity"] == "critical" else ":warning:"
     if event["event"] == "changed":
         return f"{icon} *{event['check']}*{on} — something else is failing too{duration}: {detail}"

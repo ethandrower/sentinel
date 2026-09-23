@@ -512,7 +512,8 @@ def test_an_alert_says_what_where_and_for_how_long():
         "check": "queues-prod", "target": "cloud.citemed.com", "event": "recovered",
         "severity": "critical", "since": since, "detail": "nothing failing",
     })
-    check("recovery says how long it was down", "recovered (for 6 min)" in recovered)
+    # "recovered (for 6 min)" would read as though the recovery lasted six minutes.
+    check("recovery says how long it was down", "recovered (after 6 min)" in recovered)
 
 
 def test_a_check_target_is_the_system_it_watches():
