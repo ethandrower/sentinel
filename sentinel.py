@@ -689,6 +689,34 @@ def announce_threaded(events, state, threads, token, channel):
     return undelivered
 
 
+def run_event_hook(command, events):
+    """Run `command` once per event, with the event as JSON on its stdin.
+
+    The hook is for handing an incident to something that can explain or act on
+    it — an on-call agent, a ticket opener — while sentinel itself stays the
+    deterministic part. It is therefore started and *not* waited for: a slow or
+    broken hook must never delay an alert, and cannot fail a run.
+    """
+    if not command or not events:
+        return 0
+    started = 0
+    for event in events:
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            proc.stdin.write(json.dumps(event, sort_keys=True).encode())
+            proc.stdin.close()
+            started += 1
+        except Exception as e:
+            print(f"{_stamp()}  [sentinel] event hook failed to start: {e}", file=sys.stderr)
+    return started
+
+
 def heartbeat(url):
     """Ping an external dead-man's switch so a dead sentinel is itself noticed."""
     if not url:
@@ -856,6 +884,12 @@ def main():
                 post_slack(webhook, text)
             else:
                 print(f"{_stamp()}  [sentinel] no Slack configured; alert follows:\n" + text, file=sys.stderr)
+
+    # Hand the transitions to whatever acts on them (an agent, a ticket opener).
+    # After Slack: the alert is what must never wait on anything else.
+    hook = os.environ.get("SENTINEL_EVENT_HOOK") or settings.get("event_hook")
+    if events and hook:
+        run_event_hook([hook] if isinstance(hook, str) else list(hook), events)
 
     # Heartbeat last and only on a completed run, so a crashed sentinel trips the switch.
     heartbeat(os.environ.get("SENTINEL_HEARTBEAT_URL") or settings.get("heartbeat_url"))

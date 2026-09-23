@@ -49,6 +49,12 @@ creeping upward does not. A token, if needed, comes from the environment
 variable named by `bearer_env`, never from `checks.yaml`; a missing variable
 fails the check rather than sending an anonymous request.
 
+`event_hook: /path/to/script` (or `SENTINEL_EVENT_HOOK`) runs a command once
+per transition, with the event as JSON on its stdin — for handing an incident
+to something that can explain or act on it, such as an on-call agent or a
+ticket opener. It is started and never waited for, after Slack: a slow or
+broken hook cannot delay an alert or fail a run.
+
 Any check can take `every_minutes` to run on a slower clock than cron's —
 for a canary that performs real work (live scrapes, paid API calls) and
 should run hourly rather than every five minutes. Its last run is kept in the

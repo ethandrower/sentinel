@@ -546,6 +546,47 @@ def test_events_share_one_incident_id_and_are_appended():
     check("appended, never rewritten", len(lines) == 3 and json.loads(lines[2])["event"] == "recovered")
 
 
+# --------------------------------------------------------------------------
+# The event hook: hand an incident to something that can act on it
+# --------------------------------------------------------------------------
+
+
+def test_the_hook_receives_each_event_as_json():
+    print("hook: one run per event, the event on stdin")
+    import time
+
+    with tempfile.TemporaryDirectory() as d:
+        seen = Path(d) / "seen"
+        seen.mkdir()
+        script = Path(d) / "hook.sh"
+        # One file per run: the hook is started twice, concurrently.
+        script.write_text(f'#!/bin/sh\ncat > "{seen}/$$.json"\n')
+        script.chmod(0o755)
+        events = [
+            {"check": "web", "event": "fail", "incident": "web@t0"},
+            {"check": "db", "event": "recovered", "incident": "db@t1"},
+        ]
+        check("both started", sentinel.run_event_hook([str(script)], events) == 2)
+        for _ in range(50):  # it is deliberately not waited for
+            files = list(seen.glob("*.json"))
+            if len(files) == 2 and all(f.read_text().strip() for f in files):
+                break
+            time.sleep(0.1)
+        delivered = [json.loads(f.read_text()) for f in seen.glob("*.json")]
+    check("each event delivered whole", {e["check"] for e in delivered} == {"web", "db"})
+    check("and delivered as the event, not a summary", {e["event"] for e in delivered} == {"fail", "recovered"})
+
+
+def test_a_broken_hook_does_not_stop_a_run():
+    print("hook: a hook that cannot start is logged, never raised")
+    check("no exception, nothing started", sentinel.run_event_hook(["/does/not/exist"], [{"a": 1}]) == 0)
+
+
+def test_no_events_means_no_hook_run():
+    print("hook: a quiet run wakes nobody")
+    check("not started", sentinel.run_event_hook(["/bin/true"], []) == 0)
+
+
 if __name__ == "__main__":
     for fn in [v for k, v in sorted(globals().items()) if k.startswith("test_")]:
         fn()
