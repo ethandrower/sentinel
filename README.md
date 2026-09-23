@@ -27,6 +27,7 @@ report is its own death, which is what `heartbeat_url` is for.
 | type | proves | key options |
 |---|---|---|
 | `http` | responds, fast enough, valid TLS | `expect_status`, `body_contains`, `max_latency_ms`, `tls_min_days` |
+| `json` | a health endpoint reports nothing failing | `url`, `field` (default `failing`), `bearer_env` |
 | `ping` | host is up at all | `count` |
 | `tcp` | a port is open | `host`, `port` |
 | `ssh` | anything expressible as a command | `max_value`, `min_value`, `output_matches` |
@@ -38,6 +39,32 @@ report is its own death, which is what `heartbeat_url` is for.
 
 TLS expiry rides along with the HTTPS check, so there's no separate cert
 monitor to forget about.
+
+`json` is for an app that can judge its own health better than an outside
+probe can — "this queue has not moved in 15 minutes", "the broker is evicting
+keys". The endpoint returns the problems as a list; empty means healthy. Each
+name becomes part of the failure key (numbers stripped), so a second problem
+appearing inside an already-failing check alerts as *changed*, while a count
+creeping upward does not. A token, if needed, comes from the environment
+variable named by `bearer_env`, never from `checks.yaml`; a missing variable
+fails the check rather than sending an anonymous request.
+
+A check can carry `slack_channel:` to post somewhere other than
+`SENTINEL_SLACK_CHANNEL`. Production pages the room that fixes it; staging and
+pre-prod go to a notifications channel, rather than teaching that room to
+scroll past alerts.
+
+`event_hook: /path/to/script` (or `SENTINEL_EVENT_HOOK`) runs a command once
+per transition, with the event as JSON on its stdin — for handing an incident
+to something that can explain or act on it, such as an on-call agent or a
+ticket opener. It is started and never waited for, after Slack: a slow or
+broken hook cannot delay an alert or fail a run.
+
+Any check can take `every_minutes` to run on a slower clock than cron's —
+for a canary that performs real work (live scrapes, paid API calls) and
+should run hourly rather than every five minutes. Its last run is kept in the
+state file, so no second cron line is needed. `--only` and `--dry-run` always
+run it.
 
 `disk`, `memory`, `docker`, `log` and `deadman` are sugar over `ssh` — they
 build a command, run it, and compare. Anything they can't express, `ssh` with
@@ -58,6 +85,15 @@ This is what decides whether anyone still reads the channel in a month.
   row before Slack hears about it. One blip stays quiet.
 - **State-change only** — a host down for six hours produces *one* alert, not
   seventy-two.
+- **…but a check that starts failing *differently* speaks up** — a check that
+  covers several things (every container of an app, say) is one check but many
+  possible failures. If it is already failing for one reason and a second one
+  appears, that is announced as *changed*. Numbers are ignored when comparing,
+  so an error count wobbling between 6 and 7 is not a new failure. Without
+  this, one stuck false positive silences everything else behind it.
+- **Deploy leftovers are not outages** — dokku's `*.upcoming-<n>` containers
+  from an abandoned deploy are ignored by `docker` checks; the app's real
+  process containers are still checked.
 - **Recovery notices** — and only if a failure was actually announced, so a
   silent blip doesn't produce a cheerful "recovered!" for something nobody
   knew was broken.
@@ -71,10 +107,16 @@ This is what decides whether anyone still reads the channel in a month.
 ./sentinel.py --dry-run         # run everything, print, touch nothing
 ./sentinel.py --only web-prod   # one check
 ./sentinel.py --list            # what's configured
-./sentinel.py --quiet           # print only failures (what cron uses)
+./sentinel.py --quiet           # log only changes (what cron uses)
+./sentinel.py --status          # what is failing right now, from the state file
 ```
 
 Exit code is `1` if anything is failing, `0` if all clear.
+
+With `--quiet` the log is a record of *changes*: one timestamped line when a
+check starts failing, fails differently, or recovers, and nothing at all on a
+run where nothing changed. A steady outage therefore does not repeat every five
+minutes — use `--status` to see what is failing now and since when.
 
 ## Setup
 

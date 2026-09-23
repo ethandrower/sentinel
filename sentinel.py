@@ -25,6 +25,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,17 +42,51 @@ SSH_OPTS = [
 ]
 
 
+def _stamp():
+    """UTC timestamp for log lines. A log that cannot say *when* cannot explain anything."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _one_line(text):
+    """Collapse a detail to a single line.
+
+    ssh reports some failures on two lines — "Connection timed out during banner
+    exchange", then "Connection to <host> port 22 timed out". Printed as-is the
+    second line lands in the log bare, with no check name and no status, and
+    reads as noise from nowhere.
+    """
+    return " · ".join(p.strip() for p in str(text or "").splitlines() if p.strip())
+
+
+def failure_key(detail):
+    """What a failure *is*, with the parts that drift from run to run removed.
+
+    "6 matches ... above threshold 5" and "7 matches ... above threshold 5" are
+    the same problem, and so are "91% RAM" and "93% RAM". Re-alerting on every
+    wobble in a count would be noise of its own. Checks that can say precisely
+    what is broken (the docker check names the containers) supply their own key.
+    """
+    return re.sub(r"\d+(?:\.\d+)?", "#", detail or "")
+
+
 class Result:
-    """Outcome of one check. `ok` drives alerting; `detail` is the human line."""
+    """Outcome of one check. `ok` drives alerting; `detail` is the human line.
 
-    __slots__ = ("name", "ok", "detail", "severity", "latency_ms")
+    `key` is the failure's stable identity, used to notice when an
+    already-failing check starts failing *differently*. `reason` is set by
+    `reconcile` to say why a failure is being announced.
+    """
 
-    def __init__(self, name, ok, detail, severity="critical", latency_ms=None):
+    __slots__ = ("name", "ok", "detail", "severity", "latency_ms", "key", "reason")
+
+    def __init__(self, name, ok, detail, severity="critical", latency_ms=None, key=None):
         self.name = name
         self.ok = ok
-        self.detail = detail
+        self.detail = _one_line(detail)
         self.severity = severity
         self.latency_ms = latency_ms
+        self.key = key if key is not None else failure_key(self.detail)
+        self.reason = "new"
 
 
 # --------------------------------------------------------------------------
@@ -118,6 +153,54 @@ def check_http(cfg):
             return False, f"HTTP {status} but TLS check failed: {e}", latency_ms
 
     return True, f"HTTP {status} in {latency_ms}ms", latency_ms
+
+
+def check_json(cfg):
+    """GET a JSON health endpoint and fail on exactly the problems it names.
+
+    The endpoint does the judging — "this queue has not moved in 15 minutes",
+    "the broker is evicting keys" — and returns them as a list (`field`,
+    default "failing"). An empty list is healthy. The failure key is the set of
+    names with numbers stripped, so a second queue going stale inside an
+    already-failing check re-alerts as "changed", while a count creeping from
+    +3 to +7 evictions does not.
+
+    A bearer token, when needed, is read from the environment variable named
+    by `bearer_env`: secrets never go in checks.yaml. A missing variable is a
+    failure, not an unauthenticated request — a monitor that silently stops
+    authenticating would read every 401 as the app being down.
+    """
+    url, field = cfg["url"], cfg.get("field", "failing")
+    headers = {"User-Agent": "sentinel/1.0", "Accept": "application/json"}
+    token_env = cfg.get("bearer_env")
+    if token_env:
+        token = os.environ.get(token_env, "")
+        if not token:
+            return False, f"{token_env} is not set; cannot authenticate", None, "json:no-token"
+        headers["Authorization"] = f"Bearer {token}"
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    started = time.monotonic()
+    try:
+        resp = opener.open(urllib.request.Request(url, headers=headers), timeout=cfg.get("timeout", 15))
+        status, body = resp.status, resp.read(262144)
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}", None, f"json:http-{e.code}"
+    except Exception as e:
+        return False, f"unreachable: {type(e).__name__}: {e}", None, "json:unreachable"
+    latency_ms = int((time.monotonic() - started) * 1000)
+
+    try:
+        items = json.loads(body).get(field)
+    except (ValueError, AttributeError):
+        return False, f"HTTP {status} but the response is not a JSON object", latency_ms, "json:not-json"
+    if not isinstance(items, list):
+        return False, f"HTTP {status} but no {field!r} list in the response", latency_ms, "json:shape"
+    if items:
+        names = [str(item) for item in items]
+        key = "json:" + ",".join(sorted(failure_key(name) for name in names))
+        return False, "; ".join(names)[:250], latency_ms, key
+    return True, f"HTTP {status}, nothing failing, in {latency_ms}ms", latency_ms
 
 
 def check_tcp(cfg):
@@ -232,20 +315,33 @@ def check_docker(cfg):
     if not out:
         return False, f"no container matching {names}", None
 
-    bad, seen = [], set()
+    bad, bad_names, seen = [], [], set()
     for line in out.splitlines():
         parts = line.split("\t")
         if len(parts) < 3:
             continue
         name, state, status = parts[0], parts[1], parts[2]
+        if ".upcoming-" in name:
+            # dokku names the container for an in-flight deploy
+            # `<app>.<proc>.<n>.upcoming-<id>`, and a deploy that fails leaves
+            # it behind, exited, indefinitely. It is not a process the app
+            # runs. Counting it made this check fail continuously — and because
+            # alerts fire on transitions, a check that is always failing never
+            # transitions, so it silently absorbed a real OOM-killed worker.
+            continue
         seen.add(name)
         if state != "running" or "unhealthy" in status.lower():
             bad.append(f"{name}={state}/{status}")
+            # The key omits the status text on purpose: "Exited (1) 13 hours
+            # ago" becomes "About an hour ago" and then "2 days ago", and a key
+            # that drifts would re-alert on the passage of time.
+            bad_names.append(f"{name}={state}")
     missing = [n for n in names if not any(s.startswith(n) for s in seen)]
     if missing:
         bad.append(f"missing={','.join(missing)}")
+        bad_names.append(f"missing={','.join(sorted(missing))}")
     if bad:
-        return False, "; ".join(bad)[:250], None
+        return False, "; ".join(bad)[:250], None, "docker:" + ",".join(sorted(bad_names))
     return True, f"{len(seen)} container(s) running", None
 
 
@@ -297,7 +393,7 @@ def _shq(s):
 
 
 CHECKERS = {
-    "http": check_http, "tcp": check_tcp, "ping": check_ping, "ssh": check_ssh,
+    "http": check_http, "json": check_json, "tcp": check_tcp, "ping": check_ping, "ssh": check_ssh,
     "disk": check_disk, "memory": check_memory, "docker": check_docker,
     "log": check_log, "deadman": check_deadman,
 }
@@ -313,13 +409,19 @@ def run_check(cfg):
     checker = CHECKERS.get(cfg.get("type"))
     if checker is None:
         return Result(name, False, f"unknown check type {cfg.get('type')!r}", "warn")
+    key = None
     try:
-        ok, detail, latency = checker(cfg)
+        # Checkers return (ok, detail, latency) and may add a fourth element: a
+        # stable key for the failure, when they can name what broke precisely.
+        outcome = checker(cfg)
+        ok, detail, latency = outcome[0], outcome[1], outcome[2]
+        if len(outcome) > 3:
+            key = outcome[3]
     except subprocess.TimeoutExpired:
         ok, detail, latency = False, "check timed out", None
     except Exception as e:  # a broken check must not abort the whole run
         ok, detail, latency = False, f"check error: {type(e).__name__}: {e}", None
-    return Result(name, ok, detail, severity, latency)
+    return Result(name, ok, detail, severity, latency, key=key)
 
 
 def load_state(path):
@@ -336,11 +438,19 @@ def save_state(path, state):
     tmp.replace(path)  # atomic — a killed run never leaves truncated state
 
 
-def reconcile(results, state, threshold_default):
+def reconcile(results, state, threshold_default, clear_default=2):
     """Fold results into state. Returns (newly_failing, recovered) for alerting.
 
     Only transitions are returned, so a host that has been down for six hours
     produces one alert, not seventy-two.
+
+    Recovery is damped the same way failure is. A check that has alerted must
+    come back clean `clear_after` times before it is called recovered, because a
+    measurement that sits on its threshold — 6 errors, then 5, then 6 — crosses
+    it every few minutes, and announcing each crossing produces a stream of
+    alternating "warning" and "recovered" posts that say nothing and train
+    everyone to ignore the channel. Until it clears, the check stays in its
+    alerting state, so the next failure is not a new alert either.
     """
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     newly_failing, recovered = [], []
@@ -350,24 +460,63 @@ def reconcile(results, state, threshold_default):
         was_alerting = prev.get("alerting", False)
         threshold = prev.get("threshold", threshold_default)
 
+        clear_after = prev.get("clear_after", clear_default)
+
         if r.ok:
+            clean = prev.get("consecutive_ok", 0) + 1
+            if was_alerting and clean < clear_after:
+                # Clean, but not yet clean enough to say so. Hold the alerting
+                # state: this is the run that would otherwise announce a
+                # recovery the next run takes back.
+                state[r.name] = {
+                    **prev, "status": "ok", "consecutive_fail": 0, "consecutive_ok": clean,
+                    "alerting": True, "last_detail": r.detail,
+                    "threshold": threshold, "clear_after": clear_after,
+                }
+                continue
             if was_alerting:
                 recovered.append((r, prev.get("since")))
             state[r.name] = {
-                "status": "ok", "consecutive_fail": 0, "alerting": False,
+                "status": "ok", "consecutive_fail": 0, "consecutive_ok": clean, "alerting": False,
                 "since": prev.get("since", now) if prev.get("status") == "ok" else now,
-                "last_detail": r.detail, "threshold": threshold,
+                "last_detail": r.detail, "threshold": threshold, "clear_after": clear_after,
             }
         else:
             fails = prev.get("consecutive_fail", 0) + 1
-            # Damping: stay quiet until the failure repeats, so one blip is not a page.
-            alerting = fails >= threshold
+            # Damping: stay quiet until the failure repeats, so one blip is not a
+            # page. It gates *entering* an episode, not continuing one — a check
+            # that is already alerting and fails again mid-recovery stays in the
+            # same episode, or a measurement crossing its threshold would drop
+            # out of alerting and re-announce itself on the way back up.
+            alerting = was_alerting or fails >= threshold
             if alerting and not was_alerting:
                 newly_failing.append(r)
+            elif alerting and was_alerting:
+                if "key" not in prev:
+                    # State written by a version that did not record what a
+                    # failure *was*. Re-announce it once rather than assume it
+                    # is unchanged: assuming so is exactly how an OOM-killed
+                    # production worker went unreported for thirteen hours
+                    # inside a check that was already failing for another reason.
+                    r.reason = "ongoing"
+                    newly_failing.append(r)
+                elif prev["key"] != r.key:
+                    # Still failing, but failing *differently* — a second
+                    # container down, a new error. Alerting only on ok->fail
+                    # would stay silent here, which is the gap that hid the
+                    # worker above.
+                    r.reason = "changed"
+                    newly_failing.append(r)
+            # **prev keeps fields that belong to the episode, such as the Slack
+            # thread it is being discussed in. A recovery rebuilds the entry
+            # from scratch, so they never leak into the next incident.
             state[r.name] = {
-                "status": "fail", "consecutive_fail": fails, "alerting": alerting,
+                **prev,
+                "status": "fail", "consecutive_fail": fails, "consecutive_ok": 0,
+                "alerting": alerting,
                 "since": prev.get("since", now) if prev.get("status") == "fail" else now,
-                "last_detail": r.detail, "threshold": threshold,
+                "last_detail": r.detail, "threshold": threshold, "key": r.key,
+                "clear_after": clear_after,
             }
 
     return newly_failing, recovered
@@ -386,8 +535,18 @@ def post_slack(webhook, text):
         with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.status == 200
     except Exception as e:
-        print(f"[sentinel] slack post failed: {e}", file=sys.stderr)
+        print(f"{_stamp()}  [sentinel] slack post failed: {e}", file=sys.stderr)
         return False
+
+
+_REASON_TAG = {
+    "changed": " _(changed — was already failing, now failing differently)_",
+    "ongoing": " _(already failing; re-announced once after an upgrade)_",
+}
+
+
+def _alert_line(r):
+    return f"• *{r.name}* — {r.detail}{_REASON_TAG.get(r.reason, '')}"
 
 
 def format_alert(newly_failing, recovered, hostname):
@@ -397,12 +556,12 @@ def format_alert(newly_failing, recovered, hostname):
 
     if crit:
         lines.append(f":rotating_light: *{len(crit)} CRITICAL* — production check failing")
-        lines += [f"• *{r.name}* — {r.detail}" for r in crit]
+        lines += [_alert_line(r) for r in crit]
     if warn:
         if lines:
             lines.append("")
         lines.append(f":warning: *{len(warn)} warning*")
-        lines += [f"• *{r.name}* — {r.detail}" for r in warn]
+        lines += [_alert_line(r) for r in warn]
     if recovered:
         if lines:
             lines.append("")
@@ -421,6 +580,194 @@ def format_alert(newly_failing, recovered, hostname):
     return "\n".join(lines)
 
 
+SLACK_API = os.environ.get("SENTINEL_SLACK_API", "https://slack.com/api/chat.postMessage")
+
+
+def post_slack_bot(token, channel, text, thread_ts=None):
+    """Post as a Slack bot and return the message's `ts`, or None on failure.
+
+    Unlike an incoming webhook, chat.postMessage returns the message timestamp,
+    which is what a reply needs as its `thread_ts`. That is the whole reason for
+    the bot path: one thread per incident, with changes and the recovery inside
+    it rather than as separate posts nobody can connect.
+    """
+    body = {"channel": channel, "text": text, "unfurl_links": False, "unfurl_media": False}
+    if thread_ts:
+        body["thread_ts"] = thread_ts
+    req = urllib.request.Request(
+        SLACK_API,
+        data=json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            reply = json.loads(resp.read() or b"{}")
+    except Exception as e:
+        print(f"{_stamp()}  [sentinel] slack bot post failed: {e}", file=sys.stderr)
+        return None
+    if not reply.get("ok"):
+        # Slack answers 200 with ok:false for a bad token, a missing channel or
+        # a bot that was never invited; the error field says which.
+        print(f"{_stamp()}  [sentinel] slack bot post refused: {reply.get('error')}", file=sys.stderr)
+        return None
+    return reply.get("ts")
+
+
+# --------------------------------------------------------------------------
+# Events: the append-only record of every transition
+# --------------------------------------------------------------------------
+
+def build_events(newly_failing, recovered, state, hostname, targets=None):
+    """One record per transition. `incident` is stable for a check's whole episode.
+
+    `state` is the state after reconcile: a failing check's `since` is when the
+    episode began, so its fail, changed and recovered events share one incident
+    id — and `since` on every event is what lets a reader see how long this has
+    been going on. `targets` names what each check watches, because a check name
+    alone ("queues-prod") does not tell anyone which system is in trouble.
+    """
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    targets = targets or {}
+    events = []
+    for r in newly_failing:
+        since = state.get(r.name, {}).get("since")
+        events.append({
+            "id": uuid.uuid4().hex, "at": now, "host": hostname, "check": r.name,
+            "target": targets.get(r.name, ""),
+            "event": r.reason if r.reason in ("changed", "ongoing") else "fail",
+            "severity": r.severity, "detail": r.detail, "incident": f"{r.name}@{since or now}",
+            "since": since,
+        })
+    for r, since in recovered:
+        events.append({
+            "id": uuid.uuid4().hex, "at": now, "host": hostname, "check": r.name,
+            "target": targets.get(r.name, ""),
+            "event": "recovered", "severity": r.severity, "detail": r.detail,
+            "incident": f"{r.name}@{since or now}", "since": since,
+        })
+    return events
+
+
+def check_target(cfg):
+    """What a check watches, as a person would name it: a hostname or a host."""
+    if cfg.get("url"):
+        return urlparse(cfg["url"]).hostname or cfg["url"]
+    return cfg.get("host", "")
+
+
+def _for_how_long(since, word="for"):
+    """How long this incident has been running, in words.
+
+    `word` is "for" while it is failing and "after" once it has recovered —
+    "recovered (for 10 min)" reads as though the recovery lasted ten minutes.
+    """
+    if not since:
+        return ""
+    try:
+        minutes = (datetime.now(timezone.utc) - datetime.fromisoformat(since)).total_seconds() / 60
+    except ValueError:
+        return ""
+    if minutes < 1:
+        return " (just now)" if word == "for" else " (after less than a minute)"
+    if minutes < 90:
+        return f" ({word} {minutes:.0f} min)"
+    return f" ({word} {minutes / 60:.1f} hours)"
+
+
+def append_events(path, events):
+    """Append events as JSON lines. Never rewritten: this is the history.
+
+    It is what Tess reads to explain an incident and what an incident ticket's
+    timeline is built from, so a failure to write it is reported, not swallowed.
+    """
+    if not events:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        for event in events:
+            fh.write(json.dumps(event, sort_keys=True) + "\n")
+
+
+def _event_line(event):
+    """One line a person woken by it can act on: what, where, since when.
+
+    A check's name is an identifier, not an explanation, so the system it
+    watches and how long this has been going on both belong in the line.
+    """
+    detail, where = event["detail"], event.get("target", "")
+    on = f" on `{where}`" if where else ""
+    if event["event"] == "recovered":
+        down = _for_how_long(event.get("since"), word="after")
+        return f":white_check_mark: *{event['check']}*{on} recovered{down} — {detail}"
+    duration = _for_how_long(event.get("since"))
+    icon = ":rotating_light:" if event["severity"] == "critical" else ":warning:"
+    if event["event"] == "changed":
+        return f"{icon} *{event['check']}*{on} — something else is failing too{duration}: {detail}"
+    if event["event"] == "ongoing":
+        return (f"{icon} *{event['check']}*{on} is still failing{duration} "
+                f"_(re-announced once after an upgrade)_: {detail}")
+    return f"{icon} *{event['check']}*{on} is failing{duration}: {detail}"
+
+
+def announce_threaded(events, state, threads, token, channel, channels=None):
+    """Post each event in its incident's thread; return events Slack did not take.
+
+    A new failure opens a thread and its `ts` is kept in the state file for as
+    long as the incident lasts. Changes and the recovery are replies in that
+    thread, so the channel shows one line per incident instead of four
+    unconnected posts. `threads` is the state as it was before this run,
+    because a recovery clears the check's entry.
+
+    `channels` maps a check to its own channel, for checks that belong
+    somewhere other than the default: production pages the room that fixes it,
+    while staging and pre-prod go to a notifications channel instead of
+    training everyone to scroll past them.
+    """
+    undelivered = []
+    for event in events:
+        thread = threads.get(event["check"]) if event["event"] != "fail" else None
+        where = (channels or {}).get(event["check"]) or channel
+        ts = post_slack_bot(token, where, _event_line(event), thread_ts=thread)
+        if ts is None:
+            undelivered.append(event)
+            continue
+        # Where the event landed, so the events log and the hook can say which
+        # channel and thread a reply belongs in.
+        event["channel"], event["thread_ts"] = where, thread or ts
+        if event["event"] != "recovered" and event["check"] in state:
+            state[event["check"]].setdefault("thread_ts", thread or ts)
+    return undelivered
+
+
+def run_event_hook(command, events):
+    """Run `command` once per event, with the event as JSON on its stdin.
+
+    The hook is for handing an incident to something that can explain or act on
+    it — an on-call agent, a ticket opener — while sentinel itself stays the
+    deterministic part. It is therefore started and *not* waited for: a slow or
+    broken hook must never delay an alert, and cannot fail a run.
+    """
+    if not command or not events:
+        return 0
+    started = 0
+    for event in events:
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            proc.stdin.write(json.dumps(event, sort_keys=True).encode())
+            proc.stdin.close()
+            started += 1
+        except Exception as e:
+            print(f"{_stamp()}  [sentinel] event hook failed to start: {e}", file=sys.stderr)
+    return started
+
+
 def heartbeat(url):
     """Ping an external dead-man's switch so a dead sentinel is itself noticed."""
     if not url:
@@ -428,10 +775,59 @@ def heartbeat(url):
     try:
         urllib.request.urlopen(url, timeout=10).read()
     except Exception as e:
-        print(f"[sentinel] heartbeat failed: {e}", file=sys.stderr)
+        print(f"{_stamp()}  [sentinel] heartbeat failed: {e}", file=sys.stderr)
 
 
 # --------------------------------------------------------------------------
+
+#: Cron fires every few minutes and never exactly on the second, so a check
+#: due "every 60 minutes" would otherwise slip to every 65.
+_DUE_SLACK_SECONDS = 60
+
+
+def is_due(cfg, prev, now=None):
+    """Whether a check with `every_minutes` should run on this invocation.
+
+    Most checks run every time. Some cost real money or real load — a canary
+    that performs live scrapes through a paid proxy — and belong on a slower
+    clock than the one cron gives sentinel. Their last run is kept in the state
+    file, so the cadence survives across invocations without a second cron line.
+    """
+    every = cfg.get("every_minutes")
+    if not every:
+        return True
+    last = prev.get("last_run")
+    if not last:
+        return True
+    try:
+        last_at = datetime.fromisoformat(last)
+    except ValueError:
+        return True
+    now = now or datetime.now(timezone.utc)
+    return (now - last_at).total_seconds() >= every * 60 - _DUE_SLACK_SECONDS
+
+
+def print_status(state_path):
+    """What is failing right now, read from the state file.
+
+    With --quiet the log records only changes, so "is anything still broken?"
+    is answered here rather than by scrolling back through repeats.
+    """
+    state = load_state(state_path)
+    if not state:
+        print("no state yet — sentinel has not completed a run")
+        return 0
+    failing = {n: s for n, s in state.items() if s.get("status") == "fail"}
+    if not failing:
+        print(f"all {len(state)} checks passing")
+        return 0
+    print(f"{len(failing)} of {len(state)} checks failing:\n")
+    for name, s in sorted(failing.items(), key=lambda kv: kv[1].get("since", "")):
+        flag = "ALERTED" if s.get("alerting") else "damped "
+        print(f"  {flag}  {name:<28} since {s.get('since', '?')}  ({s.get('consecutive_fail', 0)} runs)")
+        print(f"           {s.get('last_detail', '')}")
+    return 1
+
 
 def main():
     ap = argparse.ArgumentParser(description="Lean estate monitor.")
@@ -440,8 +836,18 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="print results; never alert or write state")
     ap.add_argument("--only", metavar="NAME", help="run a single check by name")
     ap.add_argument("--list", action="store_true", help="list configured checks and exit")
-    ap.add_argument("--quiet", action="store_true", help="print only failures")
+    ap.add_argument(
+        "--quiet", action="store_true",
+        help="log only changes: new failures, changed failures and recoveries",
+    )
+    ap.add_argument(
+        "--status", action="store_true",
+        help="show what is failing now, from the state file, and exit",
+    )
     args = ap.parse_args()
+
+    if args.status:
+        return print_status(args.state)
 
     cfg = yaml.safe_load(args.config.read_text()) or {}
     checks = cfg.get("checks", [])
@@ -458,32 +864,90 @@ def main():
             print(f"no check named {args.only!r}", file=sys.stderr)
             return 2
 
+    state = {} if args.dry_run else load_state(args.state)
+    if not (args.only or args.dry_run):
+        checks = [c for c in checks if is_due(c, state.get(c.get("name"), {}))]
+
     workers = min(settings.get("parallelism", 8), max(len(checks), 1))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(run_check, checks))
 
-    for r in results:
-        if r.ok and args.quiet:
-            continue
-        print(f"{'ok  ' if r.ok else 'FAIL'}  {r.name:<28} {r.detail}")
-
     failing = [r for r in results if not r.ok]
 
+    # Interactive and dry runs print every check, so a person running it by
+    # hand sees the whole picture.
+    if args.dry_run or not args.quiet:
+        for r in results:
+            print(f"{_stamp()}  {'ok  ' if r.ok else 'FAIL'}  {r.name:<28} {r.detail}")
+
     if args.dry_run:
-        print(f"\n[dry-run] {len(failing)}/{len(results)} failing; state and Slack untouched")
+        print(f"{_stamp()}  [dry-run] {len(failing)}/{len(results)} failing; state and Slack untouched")
         return 1 if failing else 0
 
-    state = load_state(args.state)
-    newly_failing, recovered = reconcile(results, state, settings.get("failures_before_alert", 2))
+    # Threads as they stood before this run: a recovery rebuilds the check's
+    # entry, and its reply still has to land in the incident's thread.
+    threads = {name: entry.get("thread_ts") for name, entry in state.items() if entry.get("thread_ts")}
+    newly_failing, recovered = reconcile(
+        results,
+        state,
+        settings.get("failures_before_alert", 2),
+        settings.get("clear_after", 2),
+    )
+    events = build_events(
+        newly_failing, recovered, state, socket.gethostname(),
+        {c["name"]: check_target(c) for c in checks if c.get("name")},
+    )
+    ran_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for r in results:
+        state.setdefault(r.name, {})["last_run"] = ran_at
     save_state(args.state, state)
 
-    if newly_failing or recovered:
+    if args.quiet:
+        # The cron log records *changes* — the same things Slack is told. A
+        # check that has been failing for a day belongs in the state file (see
+        # --status), not repeated every five minutes: that repetition is what
+        # buried an OOM-killed production worker under 260 identical lines.
+        for r in newly_failing:
+            tag = {"changed": "CHANGED  ", "ongoing": "ONGOING  "}.get(r.reason, "FAIL     ")
+            print(f"{_stamp()}  {tag} {r.name:<28} {r.detail}")
+        for r, _since in recovered:
+            print(f"{_stamp()}  RECOVERED {r.name:<28} {r.detail}")
+        if newly_failing or recovered:
+            print(f"{_stamp()}  run: {len(results)} checks, {len(failing)} failing")
+
+    if events:
         webhook = os.environ.get("SENTINEL_SLACK_WEBHOOK") or settings.get("slack_webhook")
-        text = format_alert(newly_failing, recovered, socket.gethostname())
-        if webhook:
-            post_slack(webhook, text)
+        token = os.environ.get("SENTINEL_SLACK_BOT_TOKEN")
+        channel = os.environ.get("SENTINEL_SLACK_CHANNEL") or settings.get("slack_channel")
+        if token and channel:
+            per_check = {c["name"]: c["slack_channel"] for c in checks if c.get("slack_channel")}
+            undelivered = announce_threaded(events, state, threads, token, channel, per_check)
+            save_state(args.state, state)  # keep the new threads' ts
+            # Slack refused the bot: the alert still has to go out, unthreaded.
+            text = "\n".join(_event_line(e) for e in undelivered)
         else:
-            print("[sentinel] no webhook configured; alert follows:\n" + text, file=sys.stderr)
+            text = format_alert(newly_failing, recovered, socket.gethostname())
+        if text:
+            if webhook:
+                post_slack(webhook, text)
+            else:
+                print(f"{_stamp()}  [sentinel] no Slack configured; alert follows:\n" + text, file=sys.stderr)
+
+    # Recorded after Slack, so each event carries the channel and thread it was
+    # posted in: that is how whoever picks the incident up knows where to reply.
+    events_path = Path(
+        os.environ.get("SENTINEL_EVENTS") or settings.get("events_log") or args.state.with_name("events.jsonl")
+    ).expanduser()
+    try:
+        append_events(events_path, events)
+    except OSError as e:
+        print(f"{_stamp()}  [sentinel] could not append to {events_path}: {e}", file=sys.stderr)
+
+    # Hand the transitions to whatever acts on them (an agent, a ticket opener).
+    # After Slack: the alert is what must never wait on anything else.
+    hook = os.environ.get("SENTINEL_EVENT_HOOK") or settings.get("event_hook")
+    if events and hook:
+        run_event_hook([hook] if isinstance(hook, str) else list(hook), events)
 
     # Heartbeat last and only on a completed run, so a crashed sentinel trips the switch.
     heartbeat(os.environ.get("SENTINEL_HEARTBEAT_URL") or settings.get("heartbeat_url"))
