@@ -618,28 +618,57 @@ def post_slack_bot(token, channel, text, thread_ts=None):
 # Events: the append-only record of every transition
 # --------------------------------------------------------------------------
 
-def build_events(newly_failing, recovered, state, hostname):
+def build_events(newly_failing, recovered, state, hostname, targets=None):
     """One record per transition. `incident` is stable for a check's whole episode.
 
     `state` is the state after reconcile: a failing check's `since` is when the
-    episode began, so its fail, changed and recovered events share one incident id.
+    episode began, so its fail, changed and recovered events share one incident
+    id — and `since` on every event is what lets a reader see how long this has
+    been going on. `targets` names what each check watches, because a check name
+    alone ("queues-prod") does not tell anyone which system is in trouble.
     """
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    targets = targets or {}
     events = []
     for r in newly_failing:
         since = state.get(r.name, {}).get("since")
         events.append({
             "id": uuid.uuid4().hex, "at": now, "host": hostname, "check": r.name,
+            "target": targets.get(r.name, ""),
             "event": r.reason if r.reason in ("changed", "ongoing") else "fail",
             "severity": r.severity, "detail": r.detail, "incident": f"{r.name}@{since or now}",
+            "since": since,
         })
     for r, since in recovered:
         events.append({
             "id": uuid.uuid4().hex, "at": now, "host": hostname, "check": r.name,
+            "target": targets.get(r.name, ""),
             "event": "recovered", "severity": r.severity, "detail": r.detail,
             "incident": f"{r.name}@{since or now}", "since": since,
         })
     return events
+
+
+def check_target(cfg):
+    """What a check watches, as a person would name it: a hostname or a host."""
+    if cfg.get("url"):
+        return urlparse(cfg["url"]).hostname or cfg["url"]
+    return cfg.get("host", "")
+
+
+def _for_how_long(since):
+    """How long this incident has been running, in words."""
+    if not since:
+        return ""
+    try:
+        minutes = (datetime.now(timezone.utc) - datetime.fromisoformat(since)).total_seconds() / 60
+    except ValueError:
+        return ""
+    if minutes < 1:
+        return " (just now)"
+    if minutes < 90:
+        return f" (for {minutes:.0f} min)"
+    return f" (for {minutes / 60:.1f} hours)"
 
 
 def append_events(path, events):
@@ -657,15 +686,23 @@ def append_events(path, events):
 
 
 def _event_line(event):
-    detail = event["detail"]
+    """One line a person woken by it can act on: what, where, since when.
+
+    A check's name is an identifier, not an explanation, so the system it
+    watches and how long this has been going on both belong in the line.
+    """
+    detail, where = event["detail"], event.get("target", "")
+    on = f" on `{where}`" if where else ""
+    duration = _for_how_long(event.get("since"))
     if event["event"] == "recovered":
-        return f":white_check_mark: *{event['check']}* recovered — {detail}"
+        return f":white_check_mark: *{event['check']}*{on} recovered{duration} — {detail}"
     icon = ":rotating_light:" if event["severity"] == "critical" else ":warning:"
     if event["event"] == "changed":
-        return f"{icon} *{event['check']}* is now failing differently — {detail}"
+        return f"{icon} *{event['check']}*{on} — something else is failing too{duration}: {detail}"
     if event["event"] == "ongoing":
-        return f"{icon} *{event['check']}* is still failing _(re-announced once after an upgrade)_ — {detail}"
-    return f"{icon} *{event['check']}* is failing — {detail}"
+        return (f"{icon} *{event['check']}*{on} is still failing{duration} "
+                f"_(re-announced once after an upgrade)_: {detail}")
+    return f"{icon} *{event['check']}*{on} is failing{duration}: {detail}"
 
 
 def announce_threaded(events, state, threads, token, channel, channels=None):
@@ -848,7 +885,10 @@ def main():
         settings.get("failures_before_alert", 2),
         settings.get("clear_after", 2),
     )
-    events = build_events(newly_failing, recovered, state, socket.gethostname())
+    events = build_events(
+        newly_failing, recovered, state, socket.gethostname(),
+        {c["name"]: check_target(c) for c in checks if c.get("name")},
+    )
     events_path = Path(
         os.environ.get("SENTINEL_EVENTS") or settings.get("events_log") or args.state.with_name("events.jsonl")
     ).expanduser()

@@ -494,6 +494,34 @@ def test_an_incident_is_one_thread():
     check("the thread is forgotten once recovered", "thread_ts" not in state["procs"])
 
 
+def test_an_alert_says_what_where_and_for_how_long():
+    print("wording: a check name is an identifier, not an explanation")
+    from datetime import datetime, timedelta, timezone
+
+    since = (datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat(timespec="seconds")
+    line = sentinel._event_line({
+        "check": "queues-prod", "target": "cloud.citemed.com", "event": "fail",
+        "severity": "critical", "since": since,
+        "detail": "'prod_ai' queue (AI extraction) has had no worker for 5 min",
+    })
+    check("names the system, not just the check", "cloud.citemed.com" in line)
+    check("says how long", "for 6 min" in line)
+    check("carries the endpoint's own words", "AI extraction" in line)
+
+    recovered = sentinel._event_line({
+        "check": "queues-prod", "target": "cloud.citemed.com", "event": "recovered",
+        "severity": "critical", "since": since, "detail": "nothing failing",
+    })
+    check("recovery says how long it was down", "recovered (for 6 min)" in recovered)
+
+
+def test_a_check_target_is_the_system_it_watches():
+    print("wording: the target comes from the check's url or host")
+    check("url -> hostname", sentinel.check_target({"url": "https://cloud.citemed.com/x"}) == "cloud.citemed.com")
+    check("host as given", sentinel.check_target({"host": "64.227.24.99"}) == "64.227.24.99")
+    check("neither -> empty", sentinel.check_target({}) == "")
+
+
 def test_a_check_can_post_to_its_own_channel():
     print("threads: production pages the room that fixes it; staging goes to notifications")
     server, posts = _fake_slack()
