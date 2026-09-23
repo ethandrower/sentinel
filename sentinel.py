@@ -668,7 +668,7 @@ def _event_line(event):
     return f"{icon} *{event['check']}* is failing — {detail}"
 
 
-def announce_threaded(events, state, threads, token, channel):
+def announce_threaded(events, state, threads, token, channel, channels=None):
     """Post each event in its incident's thread; return events Slack did not take.
 
     A new failure opens a thread and its `ts` is kept in the state file for as
@@ -676,11 +676,17 @@ def announce_threaded(events, state, threads, token, channel):
     thread, so the channel shows one line per incident instead of four
     unconnected posts. `threads` is the state as it was before this run,
     because a recovery clears the check's entry.
+
+    `channels` maps a check to its own channel, for checks that belong
+    somewhere other than the default: production pages the room that fixes it,
+    while staging and pre-prod go to a notifications channel instead of
+    training everyone to scroll past them.
     """
     undelivered = []
     for event in events:
         thread = threads.get(event["check"]) if event["event"] != "fail" else None
-        ts = post_slack_bot(token, channel, _event_line(event), thread_ts=thread)
+        where = (channels or {}).get(event["check"]) or channel
+        ts = post_slack_bot(token, where, _event_line(event), thread_ts=thread)
         if ts is None:
             undelivered.append(event)
             continue
@@ -873,7 +879,8 @@ def main():
         token = os.environ.get("SENTINEL_SLACK_BOT_TOKEN")
         channel = os.environ.get("SENTINEL_SLACK_CHANNEL") or settings.get("slack_channel")
         if token and channel:
-            undelivered = announce_threaded(events, state, threads, token, channel)
+            per_check = {c["name"]: c["slack_channel"] for c in checks if c.get("slack_channel")}
+            undelivered = announce_threaded(events, state, threads, token, channel, per_check)
             save_state(args.state, state)  # keep the new threads' ts
             # Slack refused the bot: the alert still has to go out, unthreaded.
             text = "\n".join(_event_line(e) for e in undelivered)

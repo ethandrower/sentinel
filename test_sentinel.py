@@ -494,6 +494,26 @@ def test_an_incident_is_one_thread():
     check("the thread is forgotten once recovered", "thread_ts" not in state["procs"])
 
 
+def test_a_check_can_post_to_its_own_channel():
+    print("threads: production pages the room that fixes it; staging goes to notifications")
+    server, posts = _fake_slack()
+    try:
+        state = {}
+        results = [bad("web-prod"), bad("web-staging")]
+        threads = {}
+        reconcile(results, state, 2)
+        newly, rec = reconcile(results, state, 2)
+        events = sentinel.build_events(newly, rec, state, "monitor-host")
+        sentinel.announce_threaded(
+            events, state, threads, "xoxb-test", "C0DEV", {"web-staging": "C0NOTIFY"}
+        )
+    finally:
+        server.shutdown()
+    where = {p["text"].split("*")[1]: p["channel"] for p in posts}
+    check("production to the default channel", where["web-prod"] == "C0DEV")
+    check("staging to its own", where["web-staging"] == "C0NOTIFY")
+
+
 def test_the_next_incident_gets_a_new_thread():
     print("threads: a later failure of the same check starts fresh")
     server, posts = _fake_slack()

@@ -49,6 +49,11 @@ creeping upward does not. A token, if needed, comes from the environment
 variable named by `bearer_env`, never from `checks.yaml`; a missing variable
 fails the check rather than sending an anonymous request.
 
+A check can carry `slack_channel:` to post somewhere other than
+`SENTINEL_SLACK_CHANNEL`. Production pages the room that fixes it; staging and
+pre-prod go to a notifications channel, rather than teaching that room to
+scroll past alerts.
+
 `event_hook: /path/to/script` (or `SENTINEL_EVENT_HOOK`) runs a command once
 per transition, with the event as JSON on its stdin — for handing an incident
 to something that can explain or act on it, such as an on-call agent or a
