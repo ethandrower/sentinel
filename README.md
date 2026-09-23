@@ -94,6 +94,12 @@ This is what decides whether anyone still reads the channel in a month.
 - **Deploy leftovers are not outages** — dokku's `*.upcoming-<n>` containers
   from an abandoned deploy are ignored by `docker` checks; the app's real
   process containers are still checked.
+- **Reminders while it stays down** — state-change alerting alone means a
+  worker down all day shows one message from hours ago. `remind_after_minutes`
+  (default `[60, 240, 1440]`) posts a "still failing" reply in the incident's
+  thread, also broadcast to the channel, when the incident passes each age;
+  after the last entry it repeats at that interval (daily, by default). One
+  reminder per point, never a catch-up burst. `[]` or `null` turns it off.
 - **Recovery notices** — and only if a failure was actually announced, so a
   silent blip doesn't produce a cheerful "recovered!" for something nobody
   knew was broken.
@@ -114,7 +120,7 @@ This is what decides whether anyone still reads the channel in a month.
 Exit code is `1` if anything is failing, `0` if all clear.
 
 With `--quiet` the log is a record of *changes*: one timestamped line when a
-check starts failing, fails differently, or recovers, and nothing at all on a
+check starts failing, fails differently, recovers, or is reminded about, and nothing at all on a
 run where nothing changed. A steady outage therefore does not repeat every five
 minutes — use `--status` to see what is failing now and since when.
 

@@ -573,7 +573,7 @@ def test_each_event_records_the_channel_and_thread_it_was_posted_in():
     print("events: an event says where it landed, so whoever picks it up can reply there")
     posted = []
 
-    def fake_post(token, channel, text, thread_ts=None):
+    def fake_post(token, channel, text, thread_ts=None, broadcast=False):
         posted.append(thread_ts)
         return f"2000.{len(posted)}"
 
@@ -617,6 +617,220 @@ def test_events_share_one_incident_id_and_are_appended():
         sentinel.append_events(path, all_events[2:])
         lines = path.read_text().splitlines()
     check("appended, never rewritten", len(lines) == 3 and json.loads(lines[2])["event"] == "recovered")
+
+
+# --------------------------------------------------------------------------
+# Reminders: an incident that stays down keeps saying so
+# --------------------------------------------------------------------------
+
+
+SCHEDULE = [60, 240, 1440]
+
+
+def _open_incident(name="web", minutes_ago=0):
+    """State for a check that has alerted, with its incident begun `minutes_ago`."""
+    from datetime import datetime, timedelta, timezone
+
+    state = {}
+    reconcile([bad(name)], state, 2)
+    reconcile([bad(name)], state, 2)                  # alerting
+    start = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+    state[name]["since"] = start.isoformat(timespec="seconds")
+    return state, start
+
+
+def _remind_at(state, start, minutes, name="web", schedule=SCHEDULE):
+    """Run reconcile and the reminder pass as if `minutes` into the incident."""
+    from datetime import timedelta
+
+    results = [bad(name)]
+    reconcile(results, state, 2)
+    return sentinel.due_reminders(results, state, schedule, now=start + timedelta(minutes=minutes))
+
+
+def test_no_reminder_before_the_first_hour():
+    print("reminders: an incident under an hour old stays quiet")
+    state, start = _open_incident()
+    check("nothing at 5 min", _remind_at(state, start, 5) == [])
+    check("nothing at 59 min", _remind_at(state, start, 59) == [])
+    check("no count recorded", state["web"].get("reminders", 0) == 0)
+
+
+def test_one_reminder_at_an_hour_and_not_again():
+    print("reminders: exactly one at 60 min, none on the next run")
+    state, start = _open_incident()
+    due = _remind_at(state, start, 61)
+    check("one reminder at 61 min", [r.name for r in due] == ["web"])
+    check("count stored in the check's state", state["web"]["reminders"] == 1)
+    check("none on the next run", _remind_at(state, start, 66) == [])
+    check("none at 239 min", _remind_at(state, start, 239) == [])
+
+
+def test_second_reminder_at_four_hours():
+    print("reminders: the second fires at 240 min")
+    state, start = _open_incident()
+    _remind_at(state, start, 61)
+    check("second at 241 min", [r.name for r in _remind_at(state, start, 241)] == ["web"])
+    check("count is 2", state["web"]["reminders"] == 2)
+
+
+def test_reminders_repeat_every_day_after_the_last_point():
+    print("reminders: after 1440 min, one every 1440 min")
+    state, start = _open_incident()
+    fired = []
+    for minutes in range(0, 5 * 1440 + 1, 5):         # five days of five-minute runs
+        if _remind_at(state, start, minutes):
+            fired.append(minutes)
+    check("fires at 60, 240, then every 1440", fired == [60, 240, 1440, 2880, 4320, 5760, 7200])
+
+
+def test_a_late_run_sends_one_reminder_not_a_burst():
+    print("reminders: a monitor that missed several points catches up with one post")
+    state, start = _open_incident()
+    check("one at 25 hours", len(_remind_at(state, start, 25 * 60)) == 1)
+    check("count jumps past every missed point", state["web"]["reminders"] == 3)
+    check("and the next run is quiet", _remind_at(state, start, 25 * 60 + 5) == [])
+
+
+def test_no_reminder_once_recovered_and_count_resets():
+    print("reminders: a recovered incident is silent; the next one starts from zero")
+    from datetime import datetime, timedelta, timezone
+
+    state, start = _open_incident()
+    _remind_at(state, start, 61)
+    reconcile([ok("web")], state, 2)                  # clean, held
+    check("none while the recovery is held", sentinel.due_reminders(
+        [ok("web")], state, SCHEDULE, now=start + timedelta(minutes=300)) == [])
+    reconcile([ok("web")], state, 2)                  # recovered
+    check("count gone with the incident", "reminders" not in state["web"])
+    check("none once recovered", sentinel.due_reminders(
+        [ok("web")], state, SCHEDULE, now=start + timedelta(minutes=300)) == [])
+
+    reconcile([bad("web")], state, 2)
+    reconcile([bad("web")], state, 2)                 # a new incident
+    new_start = datetime.fromisoformat(state["web"]["since"])
+    check("new incident quiet under an hour", sentinel.due_reminders(
+        [bad("web")], state, SCHEDULE, now=new_start + timedelta(minutes=30)) == [])
+    check("and reminded afresh at an hour", len(sentinel.due_reminders(
+        [bad("web")], state, SCHEDULE, now=new_start + timedelta(minutes=61))) == 1)
+    check("counting from one", state["web"]["reminders"] == 1)
+
+
+def test_a_damped_failure_is_never_reminded():
+    print("reminders: a failure that never alerted has nothing to remind about")
+    from datetime import datetime, timedelta, timezone
+
+    state = {}
+    reconcile([bad("web")], state, 3)
+    state["web"]["since"] = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    check("not alerting -> no reminder", sentinel.due_reminders([bad("web")], state, SCHEDULE) == [])
+
+
+def test_empty_or_null_schedule_disables_reminders():
+    print("reminders: remind_after_minutes: [] or null turns them off")
+    state, start = _open_incident(minutes_ago=3000)
+    check("[] disables", sentinel.due_reminders([bad("web")], state, []) == [])
+    check("null disables", sentinel.due_reminders([bad("web")], state, None) == [])
+    check("the default would have fired", len(sentinel.due_reminders([bad("web")], state, SCHEDULE)) == 1)
+
+
+def test_a_check_with_an_event_this_run_waits_for_the_next():
+    print("reminders: a check that just posted a change is not also reminded")
+    state, _ = _open_incident(minutes_ago=90)
+    check("skipped", sentinel.due_reminders([bad("web")], state, SCHEDULE, skip={"web"}) == [])
+    check("count untouched", state["web"].get("reminders", 0) == 0)
+
+
+def test_a_reminder_event_belongs_to_its_incident():
+    print("reminders: the event carries the incident id, detail, since and target")
+    state, _ = _open_incident(minutes_ago=241)
+    due = sentinel.due_reminders([bad("web")], state, SCHEDULE)
+    events = sentinel.build_reminder_events(due, state, "monitor-host", {"web": "app.example.com"})
+    e = events[0] if events else {}
+    check("type reminder", e.get("event") == "reminder")
+    check("same incident id as the fail", e.get("incident") == f"web@{state['web']['since']}")
+    check("current detail", e.get("detail") == "unreachable")
+    check("since and target", e.get("since") == state["web"]["since"] and e.get("target") == "app.example.com")
+
+
+def test_reminder_wording_says_still_failing_and_for_how_long():
+    print("reminders: the line says it is still failing and for how long")
+    from datetime import datetime, timedelta, timezone
+
+    since = (datetime.now(timezone.utc) - timedelta(hours=4)).isoformat(timespec="seconds")
+    line = sentinel._event_line({
+        "check": "procs", "target": "app.example.com", "event": "reminder",
+        "severity": "critical", "since": since, "detail": "worker1=exited",
+    })
+    check("exact wording",
+          line == ":hourglass: *procs* on `app.example.com` is still failing (for 4.0 hours): worker1=exited")
+
+
+def test_a_reminder_replies_in_the_thread_and_is_broadcast():
+    print("reminders: posted in the incident's thread, and shown in the channel too")
+    server, posts = _fake_slack()
+    try:
+        state = {}
+        _cycle([bad("web")], state)
+        _cycle([bad("web")], state)                  # FAIL opens thread 1000.1
+        from datetime import datetime, timedelta, timezone
+        state["web"]["since"] = (datetime.now(timezone.utc) - timedelta(minutes=61)).isoformat()
+        threads = {n: e.get("thread_ts") for n, e in state.items() if e.get("thread_ts")}
+        results = [bad("web")]
+        reconcile(results, state, 2)
+        due = sentinel.due_reminders(results, state, SCHEDULE)
+        events = sentinel.build_reminder_events(due, state, "monitor-host")
+        undelivered = sentinel.announce_threaded(events, state, threads, "xoxb-test", "C0ALERTS")
+    finally:
+        server.shutdown()
+    check("two posts: fail, reminder", len(posts) == 2)
+    check("reminder replies in the thread", posts[1].get("thread_ts") == "1000.1")
+    check("and is broadcast", posts[1].get("reply_broadcast") is True)
+    check("the failure itself was not broadcast", "reply_broadcast" not in posts[0])
+    check("delivered", undelivered == [])
+    check("event records channel and thread", events[0]["channel"] == "C0ALERTS"
+          and events[0]["thread_ts"] == "1000.1")
+
+
+def test_changed_and_recovered_are_not_broadcast():
+    print("reminders: CHANGED and RECOVERED stay inside the thread")
+    server, posts = _fake_slack()
+    try:
+        state = {}
+        _cycle([Result("p", False, "a", key="k:a")], state)
+        _cycle([Result("p", False, "a", key="k:a")], state)
+        _cycle([Result("p", False, "a; b", key="k:a,b")], state)
+        _cycle([ok("p")], state)
+        _cycle([ok("p")], state)
+    finally:
+        server.shutdown()
+    check("three posts", len(posts) == 3)
+    check("none broadcast", not any(p.get("reply_broadcast") for p in posts))
+
+
+def test_a_reminder_without_a_thread_is_a_top_level_post():
+    print("reminders: an incident with no thread gets its reminder at the top level")
+    server, posts = _fake_slack()
+    try:
+        state, _ = _open_incident(minutes_ago=61)    # alerted via webhook: no thread_ts
+        due = sentinel.due_reminders([bad("web")], state, SCHEDULE)
+        events = sentinel.build_reminder_events(due, state, "monitor-host")
+        sentinel.announce_threaded(events, state, {}, "xoxb-test", "C0ALERTS")
+    finally:
+        server.shutdown()
+    check("one post", len(posts) == 1)
+    check("top level", "thread_ts" not in posts[0])
+    check("not broadcast (nothing to broadcast from)", "reply_broadcast" not in posts[0])
+
+
+def test_the_webhook_fallback_carries_reminders():
+    print("reminders: without a bot token the webhook post still says it")
+    state, _ = _open_incident(minutes_ago=61)
+    due = sentinel.due_reminders([bad("web")], state, SCHEDULE)
+    events = sentinel.build_reminder_events(due, state, "monitor-host")
+    text = format_alert([], [], "monitor-host", events)
+    check("reminder rendered", "still failing" in text and "*web*" in text)
+    check("undelivered reminders render too", "still failing" in sentinel._event_line(events[0]))
 
 
 # --------------------------------------------------------------------------

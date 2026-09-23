@@ -8,6 +8,9 @@
 settings:
   parallelism: 8
   failures_before_alert: 2        # two consecutive misses before Slack
+  # "Still failing" reminders in an open incident's thread, at these ages in
+  # minutes, then every <last> minutes. [] or null turns them off.
+  remind_after_minutes: [60, 240, 1440]
   # Prefer the env vars SENTINEL_SLACK_WEBHOOK / SENTINEL_HEARTBEAT_URL
   # (from ~/.sentinel.env) over putting secrets here.
   slack_webhook: null

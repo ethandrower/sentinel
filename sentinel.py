@@ -522,6 +522,60 @@ def reconcile(results, state, threshold_default, clear_default=2):
     return newly_failing, recovered
 
 
+#: Minutes into an open incident at which its thread is reminded that it is
+#: still open. After the last entry the reminder repeats at that interval.
+DEFAULT_REMIND_AFTER_MINUTES = [60, 240, 1440]
+
+
+def _reminders_passed(age_minutes, schedule):
+    """How many reminder points an incident of this age has passed.
+
+    `schedule` is sorted and positive. Past its last entry, every further
+    multiple of that entry counts as another point: with [60, 240, 1440] an
+    incident two days old has passed 60, 240, 1440 and 2880.
+    """
+    passed = sum(1 for m in schedule if age_minutes >= m)
+    last = schedule[-1]
+    if age_minutes >= last:
+        passed += int((age_minutes - last) // last)
+    return passed
+
+
+def due_reminders(results, state, schedule, skip=(), now=None):
+    """Checks whose open incident is due a "still failing" reminder.
+
+    State-change alerting is quiet by design, which also means a worker that
+    stays down all day shows one message from hours ago. A reminder is due when
+    the incident's age (from `since`) passes the next point in `schedule`. It is
+    one reminder, never a burst: the count stored in the check's state entry
+    jumps to every point already passed, so a monitor that was itself down for
+    a while does not catch up by posting several in a row. The count lives in
+    the incident's state entry, which a recovery rebuilds, so the next incident
+    starts again from zero.
+
+    `skip` holds checks that already produced an event this run; the thread has
+    just heard from them, so their reminder waits for the next run.
+    """
+    schedule = sorted(m for m in (schedule or []) if isinstance(m, (int, float)) and m > 0)
+    if not schedule:
+        return []
+    now = now or datetime.now(timezone.utc)
+    due = []
+    for r in results:
+        entry = state.get(r.name, {})
+        if r.ok or r.name in skip or not entry.get("alerting") or entry.get("status") != "fail":
+            continue
+        try:
+            age = (now - datetime.fromisoformat(entry["since"])).total_seconds() / 60
+        except (KeyError, TypeError, ValueError):
+            continue
+        passed = _reminders_passed(age, schedule)
+        if passed > entry.get("reminders", 0):
+            entry["reminders"] = passed
+            due.append(r)
+    return due
+
+
 # --------------------------------------------------------------------------
 # Alerting
 # --------------------------------------------------------------------------
@@ -549,7 +603,8 @@ def _alert_line(r):
     return f"• *{r.name}* — {r.detail}{_REASON_TAG.get(r.reason, '')}"
 
 
-def format_alert(newly_failing, recovered, hostname):
+def format_alert(newly_failing, recovered, hostname, reminders=()):
+    """The webhook path's single post. `reminders` are reminder events."""
     lines = []
     crit = [r for r in newly_failing if r.severity == "critical"]
     warn = [r for r in newly_failing if r.severity != "critical"]
@@ -575,6 +630,10 @@ def format_alert(newly_failing, recovered, hostname):
                 except ValueError:
                     pass
             lines.append(f"• *{r.name}* — {r.detail}{downtime}")
+    if reminders:
+        if lines:
+            lines.append("")
+        lines += [_event_line(e) for e in reminders]
 
     lines.append(f"\n_sentinel on {hostname} · {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}_")
     return "\n".join(lines)
@@ -583,17 +642,22 @@ def format_alert(newly_failing, recovered, hostname):
 SLACK_API = os.environ.get("SENTINEL_SLACK_API", "https://slack.com/api/chat.postMessage")
 
 
-def post_slack_bot(token, channel, text, thread_ts=None):
+def post_slack_bot(token, channel, text, thread_ts=None, broadcast=False):
     """Post as a Slack bot and return the message's `ts`, or None on failure.
 
     Unlike an incoming webhook, chat.postMessage returns the message timestamp,
     which is what a reply needs as its `thread_ts`. That is the whole reason for
     the bot path: one thread per incident, with changes and the recovery inside
     it rather than as separate posts nobody can connect.
+
+    `broadcast` also shows a thread reply in the channel (Slack's
+    `reply_broadcast`). It has no meaning without a thread.
     """
     body = {"channel": channel, "text": text, "unfurl_links": False, "unfurl_media": False}
     if thread_ts:
         body["thread_ts"] = thread_ts
+        if broadcast:
+            body["reply_broadcast"] = True
     req = urllib.request.Request(
         SLACK_API,
         data=json.dumps(body).encode(),
@@ -645,6 +709,24 @@ def build_events(newly_failing, recovered, state, hostname, targets=None):
             "target": targets.get(r.name, ""),
             "event": "recovered", "severity": r.severity, "detail": r.detail,
             "incident": f"{r.name}@{since or now}", "since": since,
+        })
+    return events
+
+
+def build_reminder_events(due, state, hostname, targets=None):
+    """One "reminder" event per check from `due_reminders`, in its incident."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    targets = targets or {}
+    events = []
+    for r in due:
+        entry = state.get(r.name, {})
+        since = entry.get("since")
+        events.append({
+            "id": uuid.uuid4().hex, "at": now, "host": hostname, "check": r.name,
+            "target": targets.get(r.name, ""),
+            "event": "reminder", "severity": r.severity, "detail": r.detail,
+            "incident": f"{r.name}@{since or now}", "since": since,
+            "reminder": entry.get("reminders", 0),
         })
     return events
 
@@ -701,6 +783,8 @@ def _event_line(event):
         down = _for_how_long(event.get("since"), word="after")
         return f":white_check_mark: *{event['check']}*{on} recovered{down} — {detail}"
     duration = _for_how_long(event.get("since"))
+    if event["event"] == "reminder":
+        return f":hourglass: *{event['check']}*{on} is still failing{duration}: {detail}"
     icon = ":rotating_light:" if event["severity"] == "critical" else ":warning:"
     if event["event"] == "changed":
         return f"{icon} *{event['check']}*{on} — something else is failing too{duration}: {detail}"
@@ -723,12 +807,18 @@ def announce_threaded(events, state, threads, token, channel, channels=None):
     somewhere other than the default: production pages the room that fixes it,
     while staging and pre-prod go to a notifications channel instead of
     training everyone to scroll past them.
+
+    A reminder is a reply in the thread that is also broadcast to the channel:
+    the point of it is that people who stopped reading the thread see it. An
+    incident with no thread (it alerted through the webhook) gets its reminder
+    as a new top-level post, which then becomes its thread.
     """
     undelivered = []
     for event in events:
         thread = threads.get(event["check"]) if event["event"] != "fail" else None
         where = (channels or {}).get(event["check"]) or channel
-        ts = post_slack_bot(token, where, _event_line(event), thread_ts=thread)
+        broadcast = event["event"] == "reminder" and bool(thread)
+        ts = post_slack_bot(token, where, _event_line(event), thread_ts=thread, broadcast=broadcast)
         if ts is None:
             undelivered.append(event)
             continue
@@ -893,10 +983,16 @@ def main():
         settings.get("failures_before_alert", 2),
         settings.get("clear_after", 2),
     )
-    events = build_events(
-        newly_failing, recovered, state, socket.gethostname(),
-        {c["name"]: check_target(c) for c in checks if c.get("name")},
+    targets = {c["name"]: check_target(c) for c in checks if c.get("name")}
+    events = build_events(newly_failing, recovered, state, socket.gethostname(), targets)
+    # An incident that simply stays down is otherwise silent after its first
+    # post. `remind_after_minutes: []` (or null) turns reminders off.
+    reminders = due_reminders(
+        results, state, settings.get("remind_after_minutes", DEFAULT_REMIND_AFTER_MINUTES),
+        skip={r.name for r in newly_failing},
     )
+    reminder_events = build_reminder_events(reminders, state, socket.gethostname(), targets)
+    events += reminder_events
     ran_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     for r in results:
         state.setdefault(r.name, {})["last_run"] = ran_at
@@ -912,7 +1008,9 @@ def main():
             print(f"{_stamp()}  {tag} {r.name:<28} {r.detail}")
         for r, _since in recovered:
             print(f"{_stamp()}  RECOVERED {r.name:<28} {r.detail}")
-        if newly_failing or recovered:
+        for r in reminders:
+            print(f"{_stamp()}  REMINDER  {r.name:<28} {r.detail}")
+        if newly_failing or recovered or reminders:
             print(f"{_stamp()}  run: {len(results)} checks, {len(failing)} failing")
 
     if events:
@@ -926,7 +1024,7 @@ def main():
             # Slack refused the bot: the alert still has to go out, unthreaded.
             text = "\n".join(_event_line(e) for e in undelivered)
         else:
-            text = format_alert(newly_failing, recovered, socket.gethostname())
+            text = format_alert(newly_failing, recovered, socket.gethostname(), reminder_events)
         if text:
             if webhook:
                 post_slack(webhook, text)
