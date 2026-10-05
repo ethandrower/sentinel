@@ -3,6 +3,7 @@
 # ABOUTME: Pure-logic only — no network, no SSH; run with `python3 -m pytest` or directly.
 """Run: python3 test_sentinel.py   (or pytest, if available)"""
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -881,6 +882,97 @@ def test_a_broken_hook_does_not_stop_a_run():
 def test_no_events_means_no_hook_run():
     print("hook: a quiet run wakes nobody")
     check("not started", sentinel.run_event_hook(["/bin/true"], []) == 0)
+
+
+def test_a_recovery_with_no_alert_thread_says_when_it_started():
+    print("wording: a recovery whose alert never posted stands on its own")
+    from datetime import datetime, timedelta, timezone
+
+    since = (datetime.now(timezone.utc) - timedelta(minutes=100)).isoformat(timespec="seconds")
+    posts = []
+
+    def fake_post(token, channel, text, thread_ts=None, broadcast=False):
+        posts.append((text, thread_ts))
+        return "3000.1"
+
+    real_post = sentinel.post_slack_bot
+    sentinel.post_slack_bot = fake_post
+    try:
+        event = {"check": "web-prod", "target": "cloud.citemed.com", "event": "recovered",
+                 "severity": "critical", "since": since, "detail": "HTTP 200 in 188ms"}
+        sentinel.announce_threaded([event], {}, {}, "xoxb-test", "C0ALERTS")
+        threaded = dict(event)
+        sentinel.announce_threaded([threaded], {}, {"web-prod": "2999.1"}, "xoxb-test", "C0ALERTS")
+    finally:
+        sentinel.post_slack_bot = real_post
+    orphan, inside = posts
+    check("says when it started", "It had been failing since " in orphan[0] and "(1.7 hours)" in orphan[0])
+    check("says the alert could not be posted", "the alert at the time could not be posted" in orphan[0])
+    check("still carries the detail", orphan[0].endswith("Now: HTTP 200 in 188ms"))
+    check("a recovery inside its thread keeps the short form",
+          inside[1] == "2999.1" and "could not be posted" not in inside[0] and "alert open" in inside[0])
+
+
+def test_the_monitor_knows_when_it_is_offline():
+    print("blind: no canary answering means the monitor, not the estate, is down")
+    up, up_url, _ = _serve("ok")
+    try:
+        check("one answering canary is enough", sentinel.online(["http://127.0.0.1:9/", up_url], timeout=2))
+    finally:
+        up.shutdown()
+    down, down_url, _ = _serve("nope", status=503)
+    try:
+        check("an error page is still an answer", sentinel.online([down_url], timeout=2))
+    finally:
+        down.shutdown()
+    check("nothing answering is offline", not sentinel.online(["http://127.0.0.1:9/"], timeout=2))
+
+
+def test_a_blind_notice_says_how_long_and_that_nothing_was_checked():
+    print("blind: one line replaces a check-by-check flood")
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    line = sentinel.blind_notice((now - timedelta(minutes=100)).isoformat(timespec="seconds"), now)
+    check("names it as the monitor's own outage", "Sentinel lost its own internet connection from" in line)
+    check("says how long", "(1.7 hours)" in line)
+    check("says nothing was checked", "Nothing was checked in that time" in line)
+
+
+def test_a_blind_run_checks_nothing_and_the_first_run_back_says_so_once():
+    print("blind: a run with no network records the outage, not a false incident per check")
+    import contextlib
+    import io
+
+    calls, posts = [], []
+    with tempfile.TemporaryDirectory() as d:
+        config, state_path = Path(d) / "checks.yaml", Path(d) / "state.json"
+        config.write_text("settings:\n  canaries: [http://canary.invalid/]\nchecks:\n"
+                          "  - name: web\n    type: http\n    url: http://127.0.0.1:9/\n")
+        real = (sentinel.online, sentinel.run_check, sentinel.post_slack_bot, sys.argv)
+        sentinel.run_check = lambda cfg: calls.append(cfg["name"]) or Result(cfg["name"], True, "ok")
+        sentinel.post_slack_bot = lambda token, channel, text, thread_ts=None, broadcast=False: posts.append(text) or "1.1"
+        os.environ.update(SENTINEL_SLACK_BOT_TOKEN="xoxb-test", SENTINEL_SLACK_CHANNEL="C0ALERTS")
+        try:
+            sys.argv = ["sentinel.py", "--config", str(config), "--state", str(state_path), "--quiet"]
+            sentinel.online = lambda canaries, timeout=8: False
+            with contextlib.redirect_stdout(io.StringIO()):
+                first = sentinel.main()
+                second = sentinel.main()
+            blind = load_state(state_path).get(sentinel.BLIND_KEY, {})
+            sentinel.online = lambda canaries, timeout=8: True
+            with contextlib.redirect_stdout(io.StringIO()):
+                sentinel.main()
+                sentinel.main()
+            after = load_state(state_path)
+        finally:
+            sentinel.online, sentinel.run_check, sentinel.post_slack_bot, sys.argv = real
+            for key in ("SENTINEL_SLACK_BOT_TOKEN", "SENTINEL_SLACK_CHANNEL"):
+                os.environ.pop(key, None)
+    check("a blind run exits 3 and runs no check", first == 3 and second == 3 and calls.count("web") == 2)
+    check("the outage start is kept across blind runs", bool(blind.get("since")))
+    check("the first run back posts one notice", len(posts) == 1 and "lost its own internet connection" in posts[0])
+    check("and forgets the outage", sentinel.BLIND_KEY not in after)
 
 
 if __name__ == "__main__":

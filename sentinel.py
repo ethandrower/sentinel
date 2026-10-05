@@ -796,6 +796,31 @@ def _event_line(event):
     return f"{icon} *{event['check']}*{on} is failing: {detail}"
 
 
+def _clock(iso):
+    """"17:15 UTC" for a time today, "02 Oct 17:15 UTC" otherwise; "" if unreadable."""
+    try:
+        at = datetime.fromisoformat(iso).astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return ""
+    today = datetime.now(timezone.utc).date()
+    return at.strftime("%H:%M UTC" if at.date() == today else "%d %b %H:%M UTC")
+
+
+def _orphan_recovery_line(event):
+    """A recovery whose alert never reached Slack, so it has no thread to reply in.
+
+    On its own, "recovered — alert open 1.7 hours" reads as the end of a story
+    nobody saw begin. Said in full, the line stands alone: when it started
+    failing, for how long, and that the alert itself could not be posted.
+    """
+    detail, where = event["detail"], event.get("target", "")
+    on = f" on `{where}`" if where else ""
+    started, lasted = _clock(event.get("since")), _for_how_long(event.get("since"))
+    when = f" It had been failing since {started} ({lasted})" if started and lasted else " It had been failing"
+    return (f":white_check_mark: *{event['check']}*{on} recovered.{when}; the alert at the time "
+            f"could not be posted. Now: {detail}")
+
+
 def announce_threaded(events, state, threads, token, channel, channels=None):
     """Post each event in its incident's thread; return events Slack did not take.
 
@@ -820,7 +845,9 @@ def announce_threaded(events, state, threads, token, channel, channels=None):
         thread = threads.get(event["check"]) if event["event"] != "fail" else None
         where = (channels or {}).get(event["check"]) or channel
         broadcast = event["event"] == "reminder" and bool(thread)
-        ts = post_slack_bot(token, where, _event_line(event), thread_ts=thread, broadcast=broadcast)
+        orphan = event["event"] == "recovered" and not thread
+        line = _orphan_recovery_line(event) if orphan else _event_line(event)
+        ts = post_slack_bot(token, where, line, thread_ts=thread, broadcast=broadcast)
         if ts is None:
             undelivered.append(event)
             continue
@@ -858,6 +885,51 @@ def run_event_hook(command, events):
         except Exception as e:
             print(f"{_stamp()}  [sentinel] event hook failed to start: {e}", file=sys.stderr)
     return started
+
+
+#: Places that answer whenever the monitor itself is online. A run that can reach
+#: none of them is blind: every check would fail, and none of it would be true.
+DEFAULT_CANARIES = ["https://1.1.1.1/", "https://www.google.com/generate_204"]
+#: Where in the state file the monitor keeps its own outage. Not a check name.
+BLIND_KEY = "_sentinel_blind"
+
+
+def online(canaries, timeout=8):
+    """True if any canary answers at all. An HTTP error is an answer."""
+    for url in canaries:
+        try:
+            urllib.request.urlopen(url, timeout=timeout).close()
+            return True
+        except urllib.error.HTTPError:
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def blind_notice(since, now=None):
+    """The one post that replaces a check-by-check flood when the monitor went offline."""
+    now = now or datetime.now(timezone.utc)
+    try:
+        minutes = (now - datetime.fromisoformat(since)).total_seconds() / 60
+    except (TypeError, ValueError):
+        minutes = None
+    lasted = "" if minutes is None else (f" ({minutes:.0f} min)" if minutes < 90 else f" ({minutes / 60:.1f} hours)")
+    return (f":see_no_evil: Sentinel lost its own internet connection from {_clock(since)} to "
+            f"{_clock(now.isoformat())}{lasted}. Nothing was checked in that time; checks have resumed.")
+
+
+def announce_blindness(since, settings):
+    """Post the one notice that the monitor was offline, by the bot or else the webhook."""
+    notice = blind_notice(since)
+    print(f"{_stamp()}  [sentinel] back online; was blind since {since}")
+    token = os.environ.get("SENTINEL_SLACK_BOT_TOKEN")
+    channel = os.environ.get("SENTINEL_SLACK_CHANNEL") or settings.get("slack_channel")
+    if token and channel and post_slack_bot(token, channel, notice):
+        return
+    webhook = os.environ.get("SENTINEL_SLACK_WEBHOOK") or settings.get("slack_webhook")
+    if webhook:
+        post_slack(webhook, notice)
 
 
 def heartbeat(url):
@@ -909,6 +981,9 @@ def print_status(state_path):
     if not state:
         print("no state yet — sentinel has not completed a run")
         return 0
+    if BLIND_KEY in state:
+        print(f"sentinel is offline: no canary has answered since {state[BLIND_KEY].get('since', '?')}\n")
+    state = {n: s for n, s in state.items() if not n.startswith("_")}
     failing = {n: s for n, s in state.items() if s.get("status") == "fail"}
     if not failing:
         print(f"all {len(state)} checks passing")
@@ -959,6 +1034,23 @@ def main():
     state = {} if args.dry_run else load_state(args.state)
     if not (args.only or args.dry_run):
         checks = [c for c in checks if is_due(c, state.get(c.get("name"), {}))]
+
+    # When the monitor itself is offline, every check fails at once and every
+    # alert fails to post. Running them would record a false incident per check
+    # and later announce recoveries nobody saw begin. So a blind run checks
+    # nothing, records only when the blindness began, and says so once after.
+    canaries = settings.get("canaries", DEFAULT_CANARIES)
+    if canaries and not (args.only or args.dry_run):
+        if not online(canaries):
+            since = state.setdefault(BLIND_KEY, {}).setdefault(
+                "since", datetime.now(timezone.utc).isoformat(timespec="seconds"))
+            save_state(args.state, state)
+            print(f"{_stamp()}  [sentinel] offline: no canary answered; nothing checked (blind since {since})")
+            return 3
+        blind = state.pop(BLIND_KEY, None)
+        if blind:
+            save_state(args.state, state)
+            announce_blindness(blind.get("since"), settings)
 
     workers = min(settings.get("parallelism", 8), max(len(checks), 1))
     with ThreadPoolExecutor(max_workers=workers) as pool:
