@@ -975,6 +975,80 @@ def test_a_blind_run_checks_nothing_and_the_first_run_back_says_so_once():
     check("and forgets the outage", sentinel.BLIND_KEY not in after)
 
 
+def test_describe_states_the_thresholds_the_probes_apply():
+    print("describe: one sentence per check, from the probes' own defaults")
+    d = sentinel.describe
+    check("disk default is 85%", "at or below 85%" in d({"type": "disk", "host": "h"}))
+    check("memory honours max_percent", "at or below 80%" in d({"type": "memory", "host": "h", "max_percent": 80}))
+    http = d({"type": "http", "url": "https://x.test/", "expect_status": [200, 302],
+              "max_latency_ms": 3000, "tls_min_days": 14})
+    check("http names status, latency and TLS",
+          "HTTP 200/302" in http and "3000 ms" in http and "14 days" in http)
+    check("docker lists the containers",
+          "web.1, worker.1" in d({"type": "docker", "host": "h", "containers": ["web.1", "worker.1"]}))
+    check("deadman default is 60 min", "last 60 min" in d({"type": "deadman", "host": "h", "path": "/x"}))
+    ssh = d({"type": "ssh", "host": "h", "command": "cat /secret/thing", "output_matches": "ok"})
+    check("ssh never repeats its command line", "/secret/thing" not in ssh and "/ok/" in ssh)
+    check("a check's own description wins", d({"type": "ping", "host": "h", "description": " Mine. "}) == "Mine.")
+    check("a broken check says what is missing", "missing" in d({"type": "tcp", "host": "h"}))
+
+
+def test_a_run_report_lists_every_configured_check():
+    print("run report: every check, passing or not, with its alerting state")
+    checks = [
+        {"name": "web", "type": "http", "url": "https://web.test/", "severity": "critical"},
+        {"name": "canary", "type": "ssh", "host": "h", "command": "x", "every_minutes": 60,
+         "slack_channel": "C0NONPROD", "severity": "warn"},
+    ]
+    state = {
+        "web": {"status": "fail", "since": "2026-11-26T10:00:00+00:00", "alerting": True, "last_run": "t1"},
+        "canary": {"status": "ok", "last_run": "t0", "last_detail": "fine"},
+    }
+    report = sentinel.build_run_report(
+        checks, [Result("web", False, "HTTP 502", latency_ms=40)], state,
+        {"failures_before_alert": 3}, "oc-prod", "C0PROD", "2026-11-26T10:05:00+00:00")
+    web, canary = report["checks"]
+    check("both checks are listed", [c["name"] for c in report["checks"]] == ["web", "canary"])
+    check("a run check carries its result", web["result"] == {
+        "ok": False, "detail": "HTTP 502", "latency_ms": 40, "checked_at": "2026-11-26T10:05:00+00:00"})
+    check("and its alerting state", web["status"] == "fail" and web["alerting"] and web["since"].startswith("2026"))
+    check("a check not due this run has no result but keeps its last", canary["result"] is None
+          and canary["last_detail"] == "fine")
+    check("the default channel fills in", web["channel"] == "C0PROD" and canary["channel"] == "C0NONPROD")
+    check("target and description are included", web["target"] == "web.test" and "Requests" in web["description"])
+    check("settings show what applied, with defaults",
+          report["settings"]["failures_before_alert"] == 3 and report["settings"]["clear_after"] == 2)
+
+
+def test_a_completed_run_hands_one_report_to_the_run_hook():
+    print("run hook: one report per run, never for --only")
+    import contextlib
+    import io
+
+    handed = []
+    with tempfile.TemporaryDirectory() as d:
+        config, state_path = Path(d) / "checks.yaml", Path(d) / "state.json"
+        config.write_text("settings:\n  canaries: []\n  run_hook: [report]\nchecks:\n"
+                          "  - name: a\n    type: http\n    url: http://a.test/\n"
+                          "  - name: b\n    type: ping\n    host: b.test\n")
+        real = (sentinel.run_check, sentinel.run_event_hook, sys.argv)
+        sentinel.run_check = lambda cfg: Result(cfg["name"], True, "ok")
+        sentinel.run_event_hook = lambda command, events: handed.append((command, events)) or len(events)
+        try:
+            sys.argv = ["sentinel.py", "--config", str(config), "--state", str(state_path), "--quiet"]
+            with contextlib.redirect_stdout(io.StringIO()):
+                sentinel.main()
+            full = list(handed)
+            sys.argv += ["--only", "a"]
+            with contextlib.redirect_stdout(io.StringIO()):
+                sentinel.main()
+        finally:
+            sentinel.run_check, sentinel.run_event_hook, sys.argv = real
+    check("one report went to the run hook", len(full) == 1 and full[0][0] == ["report"])
+    check("covering every check", [c["name"] for c in full[0][1][0]["checks"]] == ["a", "b"])
+    check("--only sends no report", handed == full)
+
+
 if __name__ == "__main__":
     for fn in [v for k, v in sorted(globals().items()) if k.startswith("test_")]:
         fn()

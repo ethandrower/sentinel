@@ -731,6 +731,121 @@ def check_target(cfg):
     return cfg.get("host", "")
 
 
+def _describe_http(cfg):
+    expect = cfg.get("expect_status", [200])
+    expect = "/".join(map(str, [expect] if isinstance(expect, int) else expect))
+    parts = [f"Requests {cfg['url']} without following redirects and expects HTTP {expect}"]
+    if cfg.get("body_contains"):
+        parts.append(f"with {cfg['body_contains']!r} in the body")
+    if cfg.get("max_latency_ms"):
+        parts.append(f"within {cfg['max_latency_ms']} ms")
+    sentence = " ".join(parts) + "."
+    if cfg.get("tls_min_days") and cfg["url"].startswith("https://"):
+        sentence += f" Fails when the TLS certificate has under {cfg['tls_min_days']} days left."
+    return sentence
+
+
+def _describe_ssh(cfg):
+    host = cfg["host"]
+    if cfg.get("max_value") is not None:
+        return f"Runs a command on {host} over SSH; fails when the number it prints is above {cfg['max_value']}."
+    if cfg.get("min_value") is not None:
+        return f"Runs a command on {host} over SSH; fails when the number it prints is below {cfg['min_value']}."
+    if cfg.get("output_matches"):
+        return f"Runs a command on {host} over SSH; fails unless it exits {cfg.get('expect_exit', 0)} and its output matches /{cfg['output_matches']}/."
+    return f"Runs a command on {host} over SSH; fails unless it exits {cfg.get('expect_exit', 0)}."
+
+
+def _describe_log(cfg):
+    minutes = cfg.get("since_minutes", 15)
+    where = (f"the {cfg['container']} container's logs" if "container" in cfg and "command" not in cfg
+             else "the system journal" if "command" not in cfg else "a log command's output")
+    return (f"Counts /{cfg['pattern']}/ in the last {minutes} min of {where} on {cfg['host']}; "
+            f"fails above {cfg.get('max_matches', 0)} matches, or when the log cannot be read.")
+
+
+def describe(cfg):
+    """What a check verifies, in one sentence a reviewer can read.
+
+    Built from the same defaults the probes use, so it cannot claim a threshold
+    the check does not apply. A check's own `description:` wins. Never includes
+    an SSH command line: a reader needs what is checked, not how.
+    """
+    if cfg.get("description"):
+        return str(cfg["description"]).strip()
+    kind, host = cfg.get("type"), cfg.get("host", "")
+    try:
+        if kind == "http":
+            return _describe_http(cfg)
+        if kind == "json":
+            return f"Reads {cfg['url']} and fails on anything it lists under {cfg.get('field', 'failing')!r}."
+        if kind == "tcp":
+            return f"Opens a TCP connection to {host}:{cfg['port']}."
+        if kind == "ping":
+            return f"Pings {host} ({cfg.get('count', 2)} ICMP packets); fails if none come back."
+        if kind == "ssh":
+            return _describe_ssh(cfg)
+        if kind == "disk":
+            return f"Disk use of {cfg.get('path', '/')} on {host} must stay at or below {cfg.get('max_percent', 85)}%."
+        if kind == "memory":
+            return f"RAM in use on {host} must stay at or below {cfg.get('max_percent', 90)}%."
+        if kind == "docker":
+            names = ", ".join(cfg.get("containers") or [cfg["container"]])
+            return f"Containers {names} on {host} must be running, and healthy where they declare a healthcheck."
+        if kind == "log":
+            return _describe_log(cfg)
+        if kind == "deadman":
+            return f"{cfg['path']} on {host} must have been touched in the last {cfg.get('max_age_minutes', 60)} min."
+    except KeyError as e:
+        return f"{kind} check, missing {e} in its configuration."
+    return f"Unknown check type {kind!r}."
+
+
+#: Run-level settings a run report repeats, so a reader sees the alerting rules
+#: that actually applied, with the defaults the code uses when one is unset.
+REPORTED_SETTINGS = {"failures_before_alert": 2, "clear_after": 2, "run_every_minutes": None}
+
+
+def build_run_report(all_checks, results, state, settings, hostname, default_channel, ran_at):
+    """Every configured check, its latest result and its alerting state, in one record.
+
+    Transitions (build_events) say what changed; this says what is being watched
+    at all. A reader can then see the checks that are passing, not only the ones
+    that failed. Checks not due this run (`every_minutes`) are listed with
+    `result: null` and keep their last state.
+    """
+    by_name = {r.name: r for r in results}
+    entries = []
+    for cfg in all_checks:
+        name = cfg.get("name")
+        if not name:
+            continue
+        r, entry = by_name.get(name), state.get(name, {})
+        entries.append({
+            "name": name,
+            "type": cfg.get("type", ""),
+            "target": check_target(cfg),
+            "severity": cfg.get("severity", "critical"),
+            "channel": cfg.get("slack_channel") or default_channel or "",
+            "every_minutes": cfg.get("every_minutes"),
+            "description": describe(cfg),
+            "result": None if r is None else {
+                "ok": r.ok, "detail": r.detail, "latency_ms": r.latency_ms, "checked_at": ran_at,
+            },
+            "last_run": entry.get("last_run"),
+            "last_detail": entry.get("last_detail", ""),
+            "status": entry.get("status", "ok"),
+            "since": entry.get("since"),
+            "alerting": bool(entry.get("alerting")),
+        })
+    reported = {k: settings.get(k, default) for k, default in REPORTED_SETTINGS.items()}
+    reported["remind_after_minutes"] = settings.get("remind_after_minutes", DEFAULT_REMIND_AFTER_MINUTES)
+    return {
+        "producer": "sentinel", "host": hostname, "ran_at": ran_at,
+        "settings": reported, "checks": entries,
+    }
+
+
 def _for_how_long(since):
     """How long ago `since` was, in words ("11 min", "4.0 hours"), or "".
 
@@ -1018,6 +1133,7 @@ def main():
 
     cfg = yaml.safe_load(args.config.read_text()) or {}
     checks = cfg.get("checks", [])
+    all_checks = list(checks)  # before --only and `every_minutes` narrow the run
     settings = cfg.get("settings", {})
 
     if args.list:
@@ -1140,6 +1256,15 @@ def main():
     hook = os.environ.get("SENTINEL_EVENT_HOOK") or settings.get("event_hook")
     if events and hook:
         run_event_hook([hook] if isinstance(hook, str) else list(hook), events)
+
+    # One report per completed run, to whatever shows the estate's monitoring
+    # (DeftTrust). Same detached start as the event hook, so it can never delay
+    # an alert. Not for --only: a single-check run is not the estate's picture.
+    run_hook = os.environ.get("SENTINEL_RUN_HOOK") or settings.get("run_hook")
+    if run_hook and not args.only:
+        channel = os.environ.get("SENTINEL_SLACK_CHANNEL") or settings.get("slack_channel")
+        report = build_run_report(all_checks, results, state, settings, socket.gethostname(), channel, ran_at)
+        run_event_hook([run_hook] if isinstance(run_hook, str) else list(run_hook), [report])
 
     # Heartbeat last and only on a completed run, so a crashed sentinel trips the switch.
     heartbeat(os.environ.get("SENTINEL_HEARTBEAT_URL") or settings.get("heartbeat_url"))
