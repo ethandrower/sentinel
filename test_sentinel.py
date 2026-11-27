@@ -996,7 +996,8 @@ def test_describe_states_the_thresholds_the_probes_apply():
 def test_a_run_report_lists_every_configured_check():
     print("run report: every check, passing or not, with its alerting state")
     checks = [
-        {"name": "web", "type": "http", "url": "https://web.test/", "severity": "critical"},
+        {"name": "web", "type": "http", "url": "https://web.test/", "severity": "critical",
+         "label": "Web: website", "environment": "production"},
         {"name": "canary", "type": "ssh", "host": "h", "command": "x", "every_minutes": 60,
          "slack_channel": "C0NONPROD", "severity": "warn"},
     ]
@@ -1010,14 +1011,39 @@ def test_a_run_report_lists_every_configured_check():
     web, canary = report["checks"]
     check("both checks are listed", [c["name"] for c in report["checks"]] == ["web", "canary"])
     check("a run check carries its result", web["result"] == {
-        "ok": False, "detail": "HTTP 502", "latency_ms": 40, "checked_at": "2026-11-26T10:05:00+00:00"})
+        "ok": False, "detail": "HTTP 502", "latency_ms": 40, "checked_at": "2026-11-26T10:05:00+00:00",
+        "measurement": {"value": 40, "unit": "ms", "limit": None}})
     check("and its alerting state", web["status"] == "fail" and web["alerting"] and web["since"].startswith("2026"))
     check("a check not due this run has no result but keeps its last", canary["result"] is None
           and canary["last_detail"] == "fine")
     check("the default channel fills in", web["channel"] == "C0PROD" and canary["channel"] == "C0NONPROD")
     check("target and description are included", web["target"] == "web.test" and "Requests" in web["description"])
+    check("label and environment come from the config", web["label"] == "Web: website"
+          and web["environment"] == "production")
+    check("and are blank when unset", canary["label"] == "" and canary["environment"] == "")
     check("settings show what applied, with defaults",
           report["settings"]["failures_before_alert"] == 3 and report["settings"]["clear_after"] == 2)
+
+
+def test_a_measurement_is_the_number_a_check_measured_and_never_an_error():
+    print("measurement: the charted number, its unit and limit")
+    m = sentinel.measurement
+    check("disk reads its percent and default limit",
+          m({"type": "disk"}, Result("d", False, "91% used is above threshold 85"))
+          == {"value": 91.0, "unit": "%", "limit": 85})
+    check("memory honours max_percent",
+          m({"type": "memory", "max_percent": 95}, Result("m", True, "90% RAM"))["limit"] == 95)
+    check("cpu defaults to 100", m({"type": "cpu"}, Result("c", True, "37% CPU load"))
+          == {"value": 37.0, "unit": "%", "limit": 100})
+    check("deadman reads minutes", m({"type": "deadman"}, Result("x", True, "0min since last run"))["value"] == 0.0)
+    check("an ssh error is not a measurement", m({"type": "disk"}, Result("d", False, "exit 255: refused")) is None)
+    check("a timeout is not a measurement", m({"type": "memory"}, Result("m", False, "ssh 1.2.3.4 timed out")) is None)
+    check("http reports response time", m({"type": "http", "max_latency_ms": 5000},
+                                          Result("w", True, "HTTP 200 in 90ms", latency_ms=90))
+          == {"value": 90, "unit": "ms", "limit": 5000})
+    check("ping has no measurement", m({"type": "ping"}, Result("p", True, "1.2.3.4 reachable avg 20ms")) is None)
+    check("cpu is described as load against cores",
+          "5-minute CPU load on h must stay at or below 100% of its cores" in sentinel.describe({"type": "cpu", "host": "h"}))
 
 
 def test_a_completed_run_hands_one_report_to_the_run_hook():

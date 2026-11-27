@@ -296,6 +296,20 @@ def check_memory(cfg):
     })
 
 
+def check_cpu(cfg):
+    """Sugar over ssh: the 5-minute load average as a percent of the host's CPU cores.
+
+    100% means every core busy on average. Load, not an instant sample, so one
+    busy second does not alert; `max_percent` defaults to 100.
+    """
+    return check_ssh({
+        **cfg,
+        "command": "awk -v n=$(nproc) '{printf \"%.0f\", $2/n*100}' /proc/loadavg",
+        "max_value": cfg.get("max_percent", 100),
+        "unit": "% CPU load",
+    })
+
+
 def check_docker(cfg):
     """Sugar over ssh: named containers must be running, and healthy if they declare a healthcheck."""
     names = cfg.get("containers") or [cfg["container"]]
@@ -394,7 +408,7 @@ def _shq(s):
 
 CHECKERS = {
     "http": check_http, "json": check_json, "tcp": check_tcp, "ping": check_ping, "ssh": check_ssh,
-    "disk": check_disk, "memory": check_memory, "docker": check_docker,
+    "disk": check_disk, "memory": check_memory, "cpu": check_cpu, "docker": check_docker,
     "log": check_log, "deadman": check_deadman,
 }
 
@@ -789,6 +803,9 @@ def describe(cfg):
             return f"Disk use of {cfg.get('path', '/')} on {host} must stay at or below {cfg.get('max_percent', 85)}%."
         if kind == "memory":
             return f"RAM in use on {host} must stay at or below {cfg.get('max_percent', 90)}%."
+        if kind == "cpu":
+            return (f"5-minute CPU load on {host} must stay at or below {cfg.get('max_percent', 100)}% "
+                    f"of its cores.")
         if kind == "docker":
             names = ", ".join(cfg.get("containers") or [cfg["container"]])
             return f"Containers {names} on {host} must be running, and healthy where they declare a healthcheck."
@@ -799,6 +816,36 @@ def describe(cfg):
     except KeyError as e:
         return f"{kind} check, missing {e} in its configuration."
     return f"Unknown check type {kind!r}."
+
+
+#: Check types whose result is one number worth charting: its unit, the setting
+#: that holds its alert limit, and that limit's default in the probe.
+MEASURED = {
+    "disk": ("%", "max_percent", 85),
+    "memory": ("%", "max_percent", 90),
+    "cpu": ("%", "max_percent", 100),
+    "deadman": ("min", "max_age_minutes", 60),
+}
+_LEADING_NUMBER = re.compile(r"^(-?\d+(?:\.\d+)?)")
+
+
+def measurement(cfg, r):
+    """The number a check measured, its unit and its alert limit, or None.
+
+    Taken only when the result *starts* with the number ("91% used", "0min since
+    last run"); an error such as "exit 255: ..." or "ssh timed out" is never read
+    as a measurement. HTTP checks report their response time.
+    """
+    kind = cfg.get("type")
+    if kind in MEASURED:
+        m = _LEADING_NUMBER.match(r.detail or "")
+        if not m:
+            return None
+        unit, key, default = MEASURED[kind]
+        return {"value": float(m.group(1)), "unit": unit, "limit": cfg.get(key, default)}
+    if kind in ("http", "json") and r.latency_ms is not None:
+        return {"value": r.latency_ms, "unit": "ms", "limit": cfg.get("max_latency_ms")}
+    return None
 
 
 #: Run-level settings a run report repeats, so a reader sees the alerting rules
@@ -823,6 +870,10 @@ def build_run_report(all_checks, results, state, settings, hostname, default_cha
         r, entry = by_name.get(name), state.get(name, {})
         entries.append({
             "name": name,
+            # What a person calls it ("Support Portal: disk space") and which estate
+            # it belongs to; both optional, from checks.yaml.
+            "label": cfg.get("label", ""),
+            "environment": cfg.get("environment", ""),
             "type": cfg.get("type", ""),
             "target": check_target(cfg),
             "severity": cfg.get("severity", "critical"),
@@ -831,6 +882,7 @@ def build_run_report(all_checks, results, state, settings, hostname, default_cha
             "description": describe(cfg),
             "result": None if r is None else {
                 "ok": r.ok, "detail": r.detail, "latency_ms": r.latency_ms, "checked_at": ran_at,
+                "measurement": measurement(cfg, r),
             },
             "last_run": entry.get("last_run"),
             "last_detail": entry.get("last_detail", ""),
